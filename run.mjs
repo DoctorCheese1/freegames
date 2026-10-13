@@ -2,7 +2,7 @@ import dotenv from 'dotenv';
 import { spawn } from 'node:child_process';
 import { existsSync,readFileSync,writeFileSync,unlinkSync } from 'node:fs';
 import { join } from 'node:path';
-import { ROOT,stageUpdate,applyUpdate } from './updater.mjs';
+import { ROOT,stageUpdate,applyUpdate,rollbackUpdate } from './updater.mjs';
 dotenv.config({path:join(ROOT,'.env'),quiet:true});
 const lock=join(ROOT,'.runner-lock.json');
 if(existsSync(lock)){
@@ -15,7 +15,8 @@ let child,stopping=false,busy=false,timer;
 const unlock=()=>{try{if(JSON.parse(readFileSync(lock,'utf8')).pid===process.pid)unlinkSync(lock);}catch{}};
 process.on('exit',unlock);
 function start(){
- child=spawn(process.execPath,['bot.mjs'],{cwd:ROOT,stdio:'inherit'});
+ child=spawn(process.execPath,['bot.mjs'],{cwd:ROOT,stdio:['inherit','inherit','inherit','ipc']});
+ child.on('message',message=>{if(message?.type==='update-check')void check();if(message?.type==='rollback')void rollback();});
  child.on('error',error=>console.error(`Bot start failed: ${error.message}`));
  child.on('exit',code=>{if(!busy && !stopping){console.error(`Bot stopped (${code}); close this launcher and fix the startup error.`);clearInterval(timer);process.exitCode=code || 1;}});
 }
@@ -27,9 +28,15 @@ async function stopChild(){
 async function check(startup=false){
  if(busy || stopping)return;busy=true;
  try{const update=await stageUpdate();if(update){if(!startup)await stopChild();await applyUpdate(update);}}
- catch(error){console.error(`Update: ${error.message}`);}
+ catch(error){console.error(`Update: ${error.message}`);writeFileSync(join(ROOT,'.update-status.json'),JSON.stringify({checkedAt:new Date().toISOString(),error:error.message}));}
  finally{busy=false;}
  if(!startup && !stopping && (!child || child.exitCode!==null))start();
+}
+async function rollback(){
+ if(busy || stopping)return;busy=true;
+ try{await stopChild();await rollbackUpdate();}
+ catch(error){console.error(`Rollback failed: ${error.message}`);writeFileSync(join(ROOT,'.update-status.json'),JSON.stringify({checkedAt:new Date().toISOString(),error:error.message}));}
+ finally{busy=false;if(!stopping)start();}
 }
 for(const signal of ['SIGINT','SIGTERM'])process.once(signal,async()=>{stopping=true;clearInterval(timer);await stopChild();unlock();process.exit(0);});
 if(process.env.UPDATE_ENABLED!=='false')await check(true);

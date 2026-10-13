@@ -119,3 +119,10 @@ A single-launcher PID guard prevents duplicate launchers; do not also run bot.mj
 
 ## Public release updater (2.8.1)
 Run Start-Bot.bat or npm start. The launcher checks public GitHub releases on startup and every 30 minutes, verifies SHA-256 checksums, backs up code, installs it and restarts the bot. No GitHub token is required. `.env`, `state.json`, `stat.json` and other local files are excluded from updates. Set UPDATE_ENABLED=false in .env to disable updates. New installs must download the latest release code to get this updater. Releases publish after tests pass on main; bump package.json and package-lock.json for each release.
+
+## Source health, partial recovery and update controls (v2.9)
+/health reports recent fetch successes/failures, offer counts and check times. Cached results are not a new connectivity probe. /free shows a partial-results warning for failed direct sources; selected/all-store aggregation returns healthy sources rather than failing the entire request. If every selected source fails, the command reports failure instead of an empty catalog.
+
+/updates shows installed version, latest observed release, last check result and whether a rollback backup exists. The Discord application owner can use /updates action:check or /updates action:rollback when launched through run.mjs (Start-Bot.bat/npm start). Rollback restores the latest recorded program backup through the transactional installer, restarts the bot and skips that release until a newer SHA arrives. Config/state are unchanged. Team-owned Discord applications currently cannot use owner-only controls without an individual owner ID. The running supervisor must be restarted once after updating from 2.8.1 to load its new IPC controls; later bot updates still restart automatically.
+
+This release preserves the existing token-free public GitHub release updater. New update-check metadata is local in .update-status.json and never included in release assets. Tests use mocked source failures; live Discord/rollback behavior requires verification on the host.

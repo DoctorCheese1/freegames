@@ -57,7 +57,7 @@ test('deal review checks integrate with search and filters', async () => {
 });
 test('slash command schemas preserve commands and exclude PlayStation', () => {
   const commands=commandDefinitions();
-  assert.deepEqual(commands.map(c=>c.name),['free','deals','giveaways','alerts','stopalerts','settings','preferences','wishlist','claimed','configure','notificationsettings','prime','gamepass','stores']);
+  assert.deepEqual(commands.map(c=>c.name),['free','deals','giveaways','alerts','stopalerts','settings','preferences','wishlist','claimed','configure','notificationsettings','health','updates','prime','gamepass','stores']);
   const alerts=commands.find(c=>c.name==='alerts');
   assert.equal(alerts.options[0].required,true);
   assert.ok(alerts.options.find(o=>o.name==='store').choices.every(c=>!c.value.startsWith('ps')));
@@ -210,4 +210,19 @@ test('updater excludes local secrets/state and rejects corrupt blobs',async()=>{
  const bytes=Buffer.from('source');const sha=createHash('sha1').update(`blob ${bytes.length}\0`).update(bytes).digest('hex');
  assert.doesNotThrow(()=>verifyBlob(bytes,sha));
  assert.throws(()=>verifyBlob(Buffer.from('corrupt'),sha));
+});
+
+test('partial recovery returns healthy stores and records failed source',async()=>{
+ const source=new Sources();
+ const result=await source.combine([['Steam',async()=>[{id:'one'}]],['Epic',async()=>{throw new Error('offline');}],['GOG',async()=>[{id:'two'}]]]);
+ assert.deepEqual(result.map(g=>g.id),['one','two']);
+ assert.equal(source.health.get('Epic').ok,false);
+ assert.equal(source.health.get('Steam').count,1);
+ await assert.rejects(source.combine([['Steam',async()=>{throw new Error('offline');}]]),/All selected/);
+});
+test('failed cached source is recorded and not cached as an empty success',async()=>{
+ const source=new Sources();
+ await assert.rejects(source.cached('test-source',300000,async()=>{throw new Error('offline');}));
+ assert.equal(source.cache.has('test-source'),false);
+ assert.equal(source.health.get('test-source').ok,false);
 });

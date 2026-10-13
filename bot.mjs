@@ -157,7 +157,7 @@ export function giveawayEmbed(game) {
 }
 
 export class Sources {
-  constructor(request = fetch) { this.request = request; this.cache = new Map(); this.inflight = new Map(); }
+  constructor(request = fetch) { this.request = request; this.cache = new Map(); this.inflight = new Map(); this.health = new Map(); }
   async json(address, params = {}, signal) {
     const url = new URL(address);
     for (const [key, value] of Object.entries(params)) url.searchParams.set(key, String(value));
@@ -179,9 +179,20 @@ export class Sources {
     const cached = this.cache.get(key);
     if (cached && Date.now() - cached.time < lifetime) return cached.data;
     if (this.inflight.has(key)) return this.inflight.get(key);
-    const pending = producer().then(data => { this.cache.set(key, { time: Date.now(), data }); return data; });
+    const pending = producer().then(data => { this.cache.set(key, { time: Date.now(), data }); this.health.set(key,{ok:true,time:Date.now(),count:Array.isArray(data)?data.length:null});return data; }).catch(error=>{this.health.set(key,{ok:false,time:Date.now(),error:error.message});throw error;});
     this.inflight.set(key, pending);
     try { return await pending; } finally { this.inflight.delete(key); }
+  }
+  async combine(entries) {
+    const results=await Promise.allSettled(entries.map(([,producer])=>producer()));
+    let successes=0;const games=[];
+    results.forEach((result,index)=>{
+      const name=entries[index][0];
+      if(result.status==='fulfilled'){successes++;games.push(...result.value);this.health.set(name,{ok:true,time:Date.now(),count:result.value.length});}
+      else this.health.set(name,{ok:false,time:Date.now(),error:String(result.reason.message || result.reason)});
+    });
+    if(!successes)throw new Error('All selected offer sources unavailable. Use /health for details.');
+    return [...new Map(games.map(g=>[String(g.id),g])).values()];
   }
   async giveaways(platform = 'all', kind = 'game') {
     if (!Object.hasOwn(PLATFORMS, platform)) throw new Error('Unknown platform');
@@ -191,20 +202,25 @@ export class Sources {
       if(platform==='steam' && kind==='game')return this.steamFree();
       if(platform==='epic-games-store' && kind==='game')return this.epicFree();
       if(platform==='gog' && kind==='game')return this.gogFree();
+      if(platform==='all' && kind==='game')return this.combine([['Steam',()=>this.steamFree()],['Epic',()=>this.epicFree()],['GOG',()=>this.gogFree()],['GamerPower',()=>this.feedOtherGames()]]);
       const params = { type: kind, 'sort-by': 'date' };
       if (platform !== 'all') params.platform = platform;
       const data = await this.json('https://www.gamerpower.com/api/giveaways', params);
       if (!Array.isArray(data)) throw new Error('Giveaway response changed');
       const games=data.filter(g => kind === 'game' ? paidGiveaway(g) : g.status === 'Active' && ['DLC & Loot', 'Loot'].includes(g.type) && withoutPlayStation(g));
-      if(platform==='all' && kind==='game')return [...await this.steamFree(),...await this.epicFree(),...await this.gogFree(),...games.filter(g=>!/steam|epic|gog/i.test(String(g.platforms)))];
+
       return games;
     });
   }
   async selectedGiveaways(stores,kind='game') {
     const selected=normalizeStores(stores);
     if(selected.includes('all'))return this.giveaways('all',kind);
-    const batches=await Promise.all(selected.map(store=>this.giveaways(store,kind)));
-    return [...new Map(batches.flat().map(game=>[String(game.id),game])).values()];
+    return this.combine(selected.map(store=>[PLATFORMS[store],()=>this.giveaways(store,kind)]));
+  }
+  async feedOtherGames() {
+    const data=await this.json('https://www.gamerpower.com/api/giveaways',{type:'game','sort-by':'date'});
+    if(!Array.isArray(data))throw new Error('Giveaway response changed');
+    return data.filter(g=>paidGiveaway(g) && !/steam|epic|gog/i.test(String(g.platforms)));
   }
   async freeWeekends() {
     return this.cached('steam-weekends',300000,async()=>{
@@ -325,6 +341,9 @@ export function commandDefinitions() {
     .addStringOption(o=>o.setName('action').setDescription('Action').addChoices({name:'List',value:'list'},{name:'Clear all',value:'clear'}));
   const notificationsettings = new SlashCommandBuilder().setName('notificationsettings').setDescription('Server notification filters, display and test settings').setDMPermission(false).setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
     .addStringOption(o=>o.setName('type').setDescription('Stream').addChoices({name:'100% Discount',value:'game'},{name:'DLCs & More',value:'loot'},{name:'Steam deals',value:'deals'},{name:'Free Weekend (Steam)',value:'weekend'}));
+  const health = new SlashCommandBuilder().setName('health').setDescription('Show source health from recent checks');
+  const updates = new SlashCommandBuilder().setName('updates').setDescription('Update status and owner-only check/rollback')
+    .addStringOption(o=>o.setName('action').setDescription('Action').addChoices({name:'Status',value:'status'},{name:'Check now',value:'check'},{name:'Rollback latest update',value:'rollback'}));
   const prime = new SlashCommandBuilder().setName('prime').setDescription('Open official Amazon Prime game claim offers');
   const gamepass = new SlashCommandBuilder().setName('gamepass').setDescription('Open official Xbox Game Pass catalog');
   const configure = new SlashCommandBuilder().setName('configure').setDescription('Configure separate free, DLC and deal alert channels')
@@ -337,7 +356,7 @@ export function commandDefinitions() {
   integer(configure,'min_positive','Minimum Steam positive reviews; default 80',100);
   integer(configure,'min_reviews','Minimum Steam review count; default 100',1000000);
   integer(configure,'reminder_hours','Expiry reminder lead time; default 6 hours',72);
-  return [free, deals, giveaways, alerts, stop, settings, preferences, wishlist, claimed, configure, notificationsettings, prime, gamepass, new SlashCommandBuilder().setName('stores').setDescription('List supported giveaway platforms')].map(c => {
+  return [free, deals, giveaways, alerts, stop, settings, preferences, wishlist, claimed, configure, notificationsettings, health, updates, prime, gamepass, new SlashCommandBuilder().setName('stores').setDescription('List supported giveaway platforms')].map(c => {
     const data=c.toJSON();
     delete data.dm_permission;
     const serverOnly=['alerts','stopalerts','configure','notificationsettings'].includes(data.name);
@@ -507,7 +526,10 @@ export async function main() {
     session.counts = Object.fromEntries(Object.keys(PLATFORMS).map(k=>[k,visible.filter(g=>offerMatches(g,{stores:[k]})).length]));
     let games = visible.filter(g=>offerMatches(g,{stores:session.store === 'all' ? profile.stores : [session.store]}));
     if (session.search) games = games.filter(g => String(g.title).toLowerCase().includes(session.search.toLowerCase()));
-    return offerCard(games, session, id);
+    const payload=offerCard(games,session,id);
+    const failed=[...sources.health].filter(([name,h])=>!h.ok && ['Steam','Epic','GOG','GamerPower'].includes(name)).map(([name])=>name);
+    if(failed.length)payload.embeds[0].addFields({name:'Partial results',value:`Unavailable: ${failed.join(', ')}. Working stores are still shown; /health has details.`});
+    return payload;
   };
   const sendConfigured = async (channel,payload,config={},title='Game offer',ping=true) => {
     const roles=config.role && ping?[config.role]:[];
@@ -697,7 +719,7 @@ export async function main() {
     const cmd = i.commandName;
     // Discord requires an initial acknowledgement within three seconds.
     try {
-      const privateCommand=['settings','preferences','wishlist','claimed','configure','alerts','stopalerts','stores','notificationsettings'].includes(cmd);
+      const privateCommand=['settings','preferences','wishlist','claimed','configure','alerts','stopalerts','stores','notificationsettings','health','updates'].includes(cmd);
       await i.deferReply(privateCommand ? {flags:MessageFlags.Ephemeral} : {});
     } catch(error) {
       log(`Command ${cmd} acknowledgement failed: ${error.name}; run only one bot instance and check connection latency.`);
@@ -710,6 +732,25 @@ export async function main() {
     };
     try {
       const personal=profileFor(i.user.id);
+      if(cmd==='health') {
+        const rows=[...sources.health].filter(([key])=>!key.startsWith('review')).slice(-20).map(([key,h])=>`${h.ok?'🟢':'🔴'} **${key}** — ${h.ok?(h.count===null?'OK':`${h.count} offers`):text(h.error,160)} • <t:${Math.floor(h.time/1000)}:R>`);
+        await respond({embeds:[new EmbedBuilder().setTitle('Offer source health').setDescription(rows.join('\n') || 'No source checks yet. Run /free to load sources.').setFooter({text:'Recent fetches only; cached results are not a fresh connectivity test.'})]});return;
+      }
+      if(cmd==='updates') {
+        const action=i.options.getString('action') || 'status';
+        if(action!=='status') {
+          const app=await client.application.fetch();
+          if(i.user.id!==app.owner?.id){await respond('Only the Discord application owner can request an update or rollback.');return;}
+          if(!process.send){await respond('Start the bot with Start-Bot.bat or npm start to enable supervisor controls.');return;}
+          await respond(action==='rollback'?'Rollback requested. Program files will restore from the latest backup; the bot restarts and local config/state remain intact.':'Update check requested. The bot may restart if a new release is available.');
+          process.send({type:action==='rollback'?'rollback':'update-check'});return;
+        }
+        const pkg=JSON.parse(readFileSync(join(ROOT,'package.json'),'utf8'));
+        let status={};try{status=JSON.parse(readFileSync(join(ROOT,'.update-status.json'),'utf8'));}catch{}
+        let marker={};try{marker=JSON.parse(readFileSync(join(ROOT,'.update-version.json'),'utf8'));}catch{}
+        await respond({embeds:[new EmbedBuilder().setTitle('Live update status').setDescription(`Installed: **${pkg.version}**\nLatest observed: ${status.latest || 'Not checked'}\nLast check: ${status.checkedAt || 'Not checked'}\nResult: ${status.error || status.result || 'Unknown'}\nBackup: ${marker.backup?'Available':'None recorded'}\nSupervisor: ${process.send?'Connected':'Not running'}\nUse /updates action:check or rollback (application owner only).`)]});return;
+      }
+
       if(cmd==='prime' || cmd==='gamepass'){await respond(subscriptionCard(cmd));return;}
       if(cmd==='notificationsettings') {
         if(!i.inGuild() || !i.memberPermissions?.has(PermissionFlagsBits.ManageGuild)){await respond('Manage Server permission required.');return;}

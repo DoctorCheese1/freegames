@@ -39,6 +39,7 @@ export async function stageUpdate() {
  const base='https://github.com/'+repository+'/releases/latest/download/';
  const manifest=JSON.parse((await download(base+'latest.json')).toString('utf8'));
  if(manifest.repository!==repository || !/^[a-f0-9]{40}$/.test(manifest.sha) || !/^\d+\.\d+\.\d+$/.test(manifest.version))throw new Error('Invalid release manifest');
+ await writeFile(join(ROOT,'.update-status.json'),JSON.stringify({latest:manifest.version,checkedAt:new Date().toISOString(),result:'Release checked'},null,2));
  const sha=manifest.sha,marker=join(ROOT,'.update-version.json');
  const local=JSON.parse(await readFile(join(ROOT,'package.json'),'utf8'));
  if(local.version===manifest.version || (existsSync(marker) && JSON.parse(await readFile(marker,'utf8')).sha===sha))return null;
@@ -75,4 +76,18 @@ export async function applyUpdate(update) {
   try{await execute('npm',['ci','--ignore-scripts','--no-audit','--no-fund']);}catch{console.error('Dependency restore failed; run npm ci before restarting.');}
   throw new Error(`Update rolled back: ${error.message}`);
  }finally{await rm(update.directory,{recursive:true,force:true});}
+}
+
+export async function rollbackUpdate() {
+ const marker=JSON.parse(await readFile(join(ROOT,'.update-version.json'),'utf8'));
+ const backup=marker.backup;
+ const base=join(ROOT,'.update-backups');
+ if(typeof backup!=='string' || dirname(backup)!==base)throw new Error('No valid local update backup');
+ for(const file of UPDATE_FILES)await access(join(backup,file));
+ // Restore through the same transactional installer, creating a recovery backup.
+ const stage=join(ROOT,'.update-stage','rollback-'+Date.now());await mkdir(stage,{recursive:true});
+ for(const file of UPDATE_FILES)await copyFile(join(backup,file),join(stage,file));
+ const pkg=JSON.parse(await readFile(join(stage,'package.json'),'utf8'));
+ await applyUpdate({sha:marker.sha,directory:stage,version:pkg.version});
+ await writeFile(join(ROOT,'.update-status.json'),JSON.stringify({checkedAt:new Date().toISOString(),result:'Rolled back; current release skipped until a newer commit is published'},null,2));
 }
