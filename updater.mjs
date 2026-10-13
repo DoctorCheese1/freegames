@@ -25,22 +25,34 @@ export async function execute(command,args,cwd=ROOT) {
   child.on('error',reject);child.on('exit',code=>code===0?resolve():reject(new Error(`${command} exited ${code}`)));
  });
 }
+export async function download(url) {
+ const parsed=new URL(url);
+ if(parsed.protocol!=='https:' || parsed.hostname!=='github.com' || !parsed.pathname.startsWith('/'+repository+'/releases/'))throw new Error('Invalid release URL');
+ const response=await fetch(url,{headers:{'User-Agent':'freegames-updater'},signal:AbortSignal.timeout(30000)});
+ if(!response.ok)throw new Error('Release download failed ('+response.status+')');
+ const bytes=Buffer.from(await response.arrayBuffer());
+ if(bytes.length>2*1024*1024)throw new Error('Release file exceeds size limit');
+ return bytes;
+}
 export async function stageUpdate() {
- const commit=await api('commits/main'),sha=commit.sha;
- if(!/^[a-f0-9]{40}$/.test(sha))throw new Error('Invalid commit response');
- const marker=join(ROOT,'.update-version.json');
- if(existsSync(marker) && JSON.parse(await readFile(marker,'utf8')).sha===sha)return null;
+ // Public release assets need no GitHub token.
+ const base='https://github.com/'+repository+'/releases/latest/download/';
+ const manifest=JSON.parse((await download(base+'latest.json')).toString('utf8'));
+ if(manifest.repository!==repository || !/^[a-f0-9]{40}$/.test(manifest.sha) || !/^\d+\.\d+\.\d+$/.test(manifest.version))throw new Error('Invalid release manifest');
+ const sha=manifest.sha,marker=join(ROOT,'.update-version.json');
+ const local=JSON.parse(await readFile(join(ROOT,'package.json'),'utf8'));
+ if(local.version===manifest.version || (existsSync(marker) && JSON.parse(await readFile(marker,'utf8')).sha===sha))return null;
  const directory=join(ROOT,'.update-stage',sha);await mkdir(directory,{recursive:true});
  try {
   for(const file of UPDATE_FILES) {
-   const data=await api(`contents/${encodeURIComponent(file)}?ref=${sha}`);
-   if(data.type!=='file' || data.encoding!=='base64')throw new Error(`Invalid update file ${file}`);
-   const bytes=Buffer.from(data.content.replace(/\s/g,''),'base64');verifyBlob(bytes,data.sha);
-   if(bytes.length>2*1024*1024)throw new Error('Update file exceeds size limit');
+   const asset=manifest.files?.[file];
+   if(!asset || !/^[a-f0-9]{64}$/.test(asset.sha256))throw new Error('Missing release file '+file);
+   const bytes=await download(asset.url);
+   if(createHash('sha256').update(bytes).digest('hex')!==asset.sha256)throw new Error('Release checksum mismatch: '+file);
    await writeFile(join(directory,file),bytes);
   }
   const pkg=JSON.parse(await readFile(join(directory,'package.json'),'utf8'));
-  if(pkg.name!=='free-games-discord-bot')throw new Error('Wrong update package');
+  if(pkg.name!=='free-games-discord-bot' || pkg.version!==manifest.version)throw new Error('Wrong update package');
   for(const file of ['bot.mjs','run.mjs','updater.mjs','test.mjs'])await execute(process.execPath,['--check',join(directory,file)]);
   return {sha,directory,version:pkg.version};
  }catch(error){await rm(directory,{recursive:true,force:true});throw error;}

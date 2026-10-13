@@ -1,0 +1,30 @@
+name: Publish bot release
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+      - run: npm ci --ignore-scripts --no-audit --no-fund
+      - run: npm test
+      - name: Prepare release assets
+        run: node publish-release.mjs
+      - name: Publish new version
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          VERSION=$(node -p "require('./package.json').version")
+          if gh release view "v$VERSION" >/dev/null 2>&1; then
+            echo "Version already published. Bump package.json for new code."
+            exit 1
+          fi
+          gh release create "v$VERSION" release/* --target "$GITHUB_SHA" --title "Freegames $VERSION" --notes "Public live update. Local .env, state.json and stat.json are preserved."
