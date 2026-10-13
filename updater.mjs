@@ -1,0 +1,66 @@
+import { mkdir, readFile, writeFile, copyFile, access, rm } from 'node:fs/promises';
+import { existsSync } from 'node:fs';
+import { join, dirname } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { createHash } from 'node:crypto';
+import { spawn } from 'node:child_process';
+export const ROOT=dirname(fileURLToPath(import.meta.url));
+// Exact allowlist: configuration, state, logs and other local files are never downloaded.
+export const UPDATE_FILES=['bot.mjs','run.mjs','updater.mjs','package.json','package-lock.json','README.md','Start-Bot.bat','test.mjs','.gitignore'];
+export const repository='DoctorCheese1/freegames';
+export async function api(path) {
+ const headers={Accept:'application/vnd.github+json','User-Agent':'freegames-updater','X-GitHub-Api-Version':'2022-11-28'};
+ if(process.env.GH_UPDATE_TOKEN)headers.Authorization=`Bearer ${process.env.GH_UPDATE_TOKEN.trim()}`;
+ const response=await fetch(`https://api.github.com/repos/${repository}/${path}`,{headers,signal:AbortSignal.timeout(30000)});
+ if(!response.ok)throw new Error(`GitHub update check failed (${response.status}). ${response.status===404?'For a private repository, set GH_UPDATE_TOKEN with read-only Contents access to freegames.':''}`);
+ return response.json();
+}
+export function verifyBlob(bytes,sha) {
+ const computed=createHash('sha1').update(`blob ${bytes.length}\0`).update(bytes).digest('hex');
+ if(computed!==sha)throw new Error('Update file hash mismatch');
+}
+export async function execute(command,args,cwd=ROOT) {
+ await new Promise((resolve,reject)=>{
+  const child=spawn(command,args,{cwd,stdio:'inherit',shell:process.platform==='win32' && command==='npm'});
+  child.on('error',reject);child.on('exit',code=>code===0?resolve():reject(new Error(`${command} exited ${code}`)));
+ });
+}
+export async function stageUpdate() {
+ const commit=await api('commits/main'),sha=commit.sha;
+ if(!/^[a-f0-9]{40}$/.test(sha))throw new Error('Invalid commit response');
+ const marker=join(ROOT,'.update-version.json');
+ if(existsSync(marker) && JSON.parse(await readFile(marker,'utf8')).sha===sha)return null;
+ const directory=join(ROOT,'.update-stage',sha);await mkdir(directory,{recursive:true});
+ try {
+  for(const file of UPDATE_FILES) {
+   const data=await api(`contents/${encodeURIComponent(file)}?ref=${sha}`);
+   if(data.type!=='file' || data.encoding!=='base64')throw new Error(`Invalid update file ${file}`);
+   const bytes=Buffer.from(data.content.replace(/\s/g,''),'base64');verifyBlob(bytes,data.sha);
+   if(bytes.length>2*1024*1024)throw new Error('Update file exceeds size limit');
+   await writeFile(join(directory,file),bytes);
+  }
+  const pkg=JSON.parse(await readFile(join(directory,'package.json'),'utf8'));
+  if(pkg.name!=='free-games-discord-bot')throw new Error('Wrong update package');
+  for(const file of ['bot.mjs','run.mjs','updater.mjs','test.mjs'])await execute(process.execPath,['--check',join(directory,file)]);
+  return {sha,directory,version:pkg.version};
+ }catch(error){await rm(directory,{recursive:true,force:true});throw error;}
+}
+export async function applyUpdate(update) {
+ const backup=join(ROOT,'.update-backups',`${Date.now()}-${update.sha.slice(0,8)}`);await mkdir(backup,{recursive:true});
+ const originals=[];
+ try {
+  for(const file of UPDATE_FILES) {
+   if(existsSync(join(ROOT,file))){await copyFile(join(ROOT,file),join(backup,file));originals.push(file);}
+  }
+  const current=existsSync(join(ROOT,'package-lock.json'))?await readFile(join(ROOT,'package-lock.json'),'utf8'):'';
+  const incoming=await readFile(join(update.directory,'package-lock.json'),'utf8');
+  for(const file of UPDATE_FILES)await copyFile(join(update.directory,file),join(ROOT,file));
+  if(current!==incoming)await execute('npm',['ci','--ignore-scripts','--no-audit','--no-fund']);
+  await writeFile(join(ROOT,'.update-version.json'),JSON.stringify({sha:update.sha,version:update.version,backup},null,2));
+  console.log(`Updated to ${update.version}; backup saved. Configuration and state preserved.`);
+ }catch(error){
+  for(const file of UPDATE_FILES){if(originals.includes(file))await copyFile(join(backup,file),join(ROOT,file));else await rm(join(ROOT,file),{force:true});}
+  try{await execute('npm',['ci','--ignore-scripts','--no-audit','--no-fund']);}catch{console.error('Dependency restore failed; run npm ci before restarting.');}
+  throw new Error(`Update rolled back: ${error.message}`);
+ }finally{await rm(update.directory,{recursive:true,force:true});}
+}
