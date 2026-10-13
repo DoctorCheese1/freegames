@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { parseSteam, parseDeals, qualifyReviews, withoutPlayStation, claimRows, steamRows, giveawayEmbed, Sources, commandDefinitions, parseState, paidGiveaway, offerCard, offerMatches, deadline, settingsCard, notificationPanel, themedOffer, subscriptionCard, normalizeStores, weekendOffer, steamGiveaway, epicGiveaways, gogGiveaways } from './bot.mjs';
+import { parseSteam, parseDeals, qualifyReviews, withoutPlayStation, claimRows, steamRows, giveawayEmbed, Sources, commandDefinitions, parseState, paidGiveaway, offerCard, offerMatches, deadline, settingsCard, notificationPanel, themedOffer, subscriptionCard, normalizeStores, weekendOffer, offerKey, deliveryWindow, cleanConfig, steamGiveaway, epicGiveaways, gogGiveaways } from './bot.mjs';
 const row = '<a class="search_result_row" data-ds-appid="10"><span class="title">Game</span><div class="discount_pct">-50%</div><div class="discount_original_price">$20.00</div><div class="discount_final_price">$10.00</div></a>';
 test('free rows exclude paid promotions and bundles', () => {
   const html = row + '<a class="search_result_row" data-ds-appid="570" data-price-final="0"><span class="title">Dota 2</span></a><a class="search_result_row" data-ds-appid="10,20" data-price-final="0"><span class="title">Bundle</span></a>';
@@ -57,7 +57,7 @@ test('deal review checks integrate with search and filters', async () => {
 });
 test('slash command schemas preserve commands and exclude PlayStation', () => {
   const commands=commandDefinitions();
-  assert.deepEqual(commands.map(c=>c.name),['free','deals','giveaways','alerts','stopalerts','settings','preferences','wishlist','claimed','configure','notificationsettings','health','updates','prime','gamepass','stores']);
+  assert.deepEqual(commands.map(c=>c.name),['free','deals','giveaways','alerts','stopalerts','settings','preferences','wishlist','claimed','configure','notificationsettings','health','updates','schedule','exportsettings','importsettings','prime','gamepass','stores']);
   const alerts=commands.find(c=>c.name==='alerts');
   assert.equal(alerts.options[0].required,true);
   assert.ok(alerts.options.find(o=>o.name==='store').choices.every(c=>!c.value.startsWith('ps')));
@@ -132,7 +132,7 @@ test('account commands enable private/group DM contexts; admin commands stay ser
     assert.deepEqual(command.contexts,[0,1,2]);
     assert.equal(command.dm_permission,undefined);
   }
-  for(const name of ['alerts','configure','stopalerts','notificationsettings']) {
+  for(const name of ['alerts','configure','stopalerts','notificationsettings','schedule','exportsettings','importsettings']) {
     const command=commands.find(c=>c.name===name);
     assert.deepEqual(command.integration_types,[0]);
     assert.deepEqual(command.contexts,[0]);
@@ -225,4 +225,26 @@ test('failed cached source is recorded and not cached as an empty success',async
  await assert.rejects(source.cached('test-source',300000,async()=>{throw new Error('offline');}));
  assert.equal(source.cache.has('test-source'),false);
  assert.equal(source.health.get('test-source').ok,false);
+});
+
+test('cross-feed identity ignores tracking parameters but separates offer types',()=>{
+ const a={id:'feed:1',type:'Game',open_giveaway_url:'https://store.steampowered.com/app/10/?utm_source=a'};
+ const b={...a,id:'steam:10',open_giveaway_url:'https://store.steampowered.com/app/10/'};
+ assert.equal(offerKey(a),offerKey(b));assert.notEqual(offerKey(a),offerKey({...b,type:'Free Weekend'}));
+});
+test('quiet hours wrap midnight and digest runs once per local day',()=>{
+ const c={timezone:'America/Chicago',quietStart:22,quietEnd:7,digest:true,digestHour:18};
+ assert.equal(deliveryWindow(c,new Date('2026-10-14T04:00:00Z')).quiet,true);
+ const at6=deliveryWindow(c,new Date('2026-10-13T23:00:00Z'));assert.equal(at6.digestDue,true);
+ assert.equal(deliveryWindow({...c,lastDigest:at6.day},new Date('2026-10-13T23:00:00Z')).digestDue,false);
+ assert.equal(deliveryWindow({...c,quietEnd:22},new Date('2026-10-14T04:00:00Z')).quiet,false);
+});
+test('settings export excludes runtime history and local secrets',()=>{
+ const c=cleanConfig({channel:'1',theme:'info',timezone:'America/Chicago',seen:['a'],posts:{},DISCORD_TOKEN:'secret'});
+ assert.equal(c.seen,undefined);assert.equal(c.DISCORD_TOKEN,undefined);assert.equal(c.channel,'1');
+ assert.throws(()=>cleanConfig({quietStart:99}));
+});
+test('expired offers remove claim links and label cards',()=>{
+ const game={title:'Ended',type:'Game',worth:'$10.00',end_date:'2020-01-01T00:00:00Z',open_giveaway_url:'https://www.gog.com/en/game/test'};
+ assert.equal(claimRows(game).length,0);assert.match(giveawayEmbed(game).toJSON().title,/EXPIRED/);
 });

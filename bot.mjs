@@ -125,6 +125,7 @@ export function qualifyReviews(game, payload, minPositive = 80, minReviews = 100
   return total >= minReviews && score >= minPositive ? { ...game, positive: score, reviews: total } : null;
 }
 export function claimRows(game) {
+  const end=deadline(game);if(end && end<=Date.now())return [];
   let url;
   try { url = new URL(game.open_giveaway_url); } catch { return []; }
   if (url.protocol !== 'https:') return [];
@@ -151,6 +152,9 @@ export function giveawayEmbed(game) {
       { name: 'Ends (reported by source)', value: text(game.end_date, 100) || 'Unknown' },
       { name: 'Source', value: game.source==='Steam'?'[Steam Store](https://store.steampowered.com)':game.source==='Epic Games Store'?'[Epic Games Store](https://store.epicgames.com)':game.source==='GOG'?'[GOG](https://www.gog.com)':'[GamerPower](https://www.gamerpower.com)' })
     .setFooter({ text: game.source==='Steam'?'Price verified from Steam; check availability and deadline on the store.':'Check region, key stock, and claim terms; free weekends may apply.' });
+  const ends=deadline(game);
+  if(ends && ends<=Date.now()){embed.setTitle(text('EXPIRED • '+game.title,256));embed.addFields({name:'Offer status',value:'Expired — claim availability ended.'});}
+  else if(ends && ends-Date.now()<=24*3600000)embed.addFields({name:'Leaving soon',value:`Ends <t:${Math.floor(ends/1000)}:R>`});
   if (claimRows(game).length) embed.setURL(game.open_giveaway_url);
   if (/^https:\/\//.test(game.image ?? '')) embed.setImage(game.image);
   return embed;
@@ -192,7 +196,7 @@ export class Sources {
       else this.health.set(name,{ok:false,time:Date.now(),error:String(result.reason.message || result.reason)});
     });
     if(!successes)throw new Error('All selected offer sources unavailable. Use /health for details.');
-    return [...new Map(games.map(g=>[String(g.id),g])).values()];
+    return [...new Map(games.map(g=>[offerKey(g),g])).values()];
   }
   async giveaways(platform = 'all', kind = 'game') {
     if (!Object.hasOwn(PLATFORMS, platform)) throw new Error('Unknown platform');
@@ -356,10 +360,20 @@ export function commandDefinitions() {
   integer(configure,'min_positive','Minimum Steam positive reviews; default 80',100);
   integer(configure,'min_reviews','Minimum Steam review count; default 100',1000000);
   integer(configure,'reminder_hours','Expiry reminder lead time; default 6 hours',72);
-  return [free, deals, giveaways, alerts, stop, settings, preferences, wishlist, claimed, configure, notificationsettings, health, updates, prime, gamepass, new SlashCommandBuilder().setName('stores').setDescription('List supported giveaway platforms')].map(c => {
+  const schedule=new SlashCommandBuilder().setName('schedule').setDescription('Quiet hours and daily digest for a server stream').setDMPermission(false).setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
+    .addStringOption(o=>o.setName('type').setDescription('Stream').setRequired(true).addChoices(...['game','loot','weekend','deals'].map(value=>({name:value,value}))))
+    .addStringOption(o=>o.setName('timezone').setDescription('IANA timezone; default America/Chicago').setMaxLength(80))
+    .addIntegerOption(o=>o.setName('quiet_start').setDescription('Quiet start hour 0–23').setMinValue(0).setMaxValue(23))
+    .addIntegerOption(o=>o.setName('quiet_end').setDescription('Quiet end hour 0–23; same start/end disables').setMinValue(0).setMaxValue(23))
+    .addBooleanOption(o=>o.setName('digest').setDescription('One daily digest instead of individual posts'))
+    .addIntegerOption(o=>o.setName('digest_hour').setDescription('Digest hour 0–23; default 18').setMinValue(0).setMaxValue(23));
+  const exportsettings=new SlashCommandBuilder().setName('exportsettings').setDescription('Export this server’s alert configuration').setDMPermission(false).setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild);
+  const importsettings=new SlashCommandBuilder().setName('importsettings').setDescription('Import server alert configuration from your export').setDMPermission(false).setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
+    .addAttachmentOption(o=>o.setName('file').setDescription('JSON settings export').setRequired(true));
+  return [free, deals, giveaways, alerts, stop, settings, preferences, wishlist, claimed, configure, notificationsettings, health, updates, schedule, exportsettings, importsettings, prime, gamepass, new SlashCommandBuilder().setName('stores').setDescription('List supported giveaway platforms')].map(c => {
     const data=c.toJSON();
     delete data.dm_permission;
-    const serverOnly=['alerts','stopalerts','configure','notificationsettings'].includes(data.name);
+    const serverOnly=['alerts','stopalerts','configure','notificationsettings','schedule','exportsettings','importsettings'].includes(data.name);
     data.integration_types=serverOnly ? [0] : [0,1]; // Guild install, user install
     data.contexts=serverOnly ? [0] : [0,1,2]; // Guild, bot DM, private/group DM
     return data;
@@ -374,6 +388,32 @@ export function offerMatches(game, profile = {}) {
   const haystack = `${game.title || ''} ${game.description || ''}`.toLowerCase();
   const keywords = profile.keywords || [];
   return storeMatch && (!keywords.length || keywords.some(k => haystack.includes(k.toLowerCase())));
+}
+export function offerKey(game) {
+  try {
+    const url=new URL(game.open_giveaway_url || game.url);
+    const steam=url.pathname.match(/\/app\/(\d+)/);
+    if(url.hostname==='store.steampowered.com' && steam)return `steam:${steam[1]}:${game.type || 'Game'}`;
+    url.search='';url.hash='';return `${url.hostname.toLowerCase()}${url.pathname.replace(/\/$/,'')}:${game.type || 'Game'}`;
+  }catch{return `id:${game.id}`;}
+}
+export function deliveryWindow(config,now=new Date()) {
+  const parts=new Intl.DateTimeFormat('en-CA',{timeZone:config.timezone || 'America/Chicago',year:'numeric',month:'2-digit',day:'2-digit',hour:'2-digit',hourCycle:'h23'}).formatToParts(now);
+  const get=k=>parts.find(p=>p.type===k).value, hour=Number(get('hour')),day=`${get('year')}-${get('month')}-${get('day')}`;
+  const start=config.quietStart,end=config.quietEnd;
+  const quiet=Number.isInteger(start)&&Number.isInteger(end)&&start!==end&&(start<end?hour>=start&&hour<end:hour>=start||hour<end);
+  return {quiet,day,hour,digestDue:config.digest && hour>=(config.digestHour ?? 18) && config.lastDigest!==day};
+}
+export const EXPORT_FIELDS=['channel','platform','platforms','minDiscount','minPositive','minReviews','reminderHours','minWorth','quality','theme','threads','links','react','publish','role','timezone','quietStart','quietEnd','digest','digestHour'];
+export function cleanConfig(config) {
+  const out=Object.fromEntries(EXPORT_FIELDS.filter(k=>config[k]!==undefined).map(k=>[k,config[k]]));
+  if(out.platforms)out.platforms=normalizeStores(out.platforms);
+  if(out.platform && !Object.hasOwn(PLATFORMS,out.platform))throw new Error('Invalid store');
+  if(out.theme && !Object.hasOwn(THEMES,out.theme))throw new Error('Invalid theme');
+  if(out.threads && !['none','below','inside'].includes(out.threads))throw new Error('Invalid thread setting');
+  for(const k of ['quietStart','quietEnd','digestHour'])if(out[k]!==undefined && (!Number.isInteger(out[k]) || out[k]<0 || out[k]>23))throw new Error('Invalid schedule hour');
+  if(out.timezone)new Intl.DateTimeFormat('en-US',{timeZone:out.timezone});
+  return out;
 }
 export function deadline(game) {
   const raw = String(game.end_date || '');
@@ -486,6 +526,7 @@ export function notificationPanel(config,guild,kind,tab='category') {
     rows.push(new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId(prefix+'test').setLabel('Send Test').setStyle(ButtonStyle.Secondary),new ButtonBuilder().setCustomId(prefix+'resend').setLabel('Resend').setStyle(ButtonStyle.Secondary)));
   }
   rows.push(new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId(prefix+(tab==='category'?'root':'tab-category')).setLabel('‹ Back').setStyle(ButtonStyle.Secondary),new ButtonBuilder().setCustomId(prefix+'help').setLabel('Need help?').setStyle(ButtonStyle.Secondary)));
+  rows.push(new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId(prefix+'preview').setLabel('Preview').setStyle(ButtonStyle.Secondary),new ButtonBuilder().setCustomId(prefix+'save').setLabel('Save Changes').setStyle(ButtonStyle.Success),new ButtonBuilder().setCustomId(prefix+'cancel').setLabel('Cancel').setStyle(ButtonStyle.Secondary)));
   return {embeds:[embed],components:rows};
 }
 export function themedOffer(game,config={}) {
@@ -519,7 +560,7 @@ export async function main() {
   const profileFor = user => state.users[user] ??= {stores:['all'],keywords:[],claimed:[],wishlist:[],wishlistSeen:[],hideClaimed:true,wishlistDM:false};
   const save = () => { writeFileSync(statePath + '.tmp', JSON.stringify(state, null, 2)); renameSync(statePath + '.tmp', statePath); };
   const client = new Client({ intents: [GatewayIntentBits.Guilds], allowedMentions: { parse: [] } });
-  const sources = new Sources(), cooldown = new Map(), sessions = new Map();
+  const sources = new Sources(), cooldown = new Map(), sessions = new Map(), drafts=new Map();
   const browse = async (session, id) => {
     const all = await sources.giveaways('all',session.kind), profile = profileFor(session.user);
     const visible = all.filter(g => (profile.hideClaimed === false || !(profile.claimed || []).includes(String(g.id))) && offerMatches(g,{...profile,stores:['all']}));
@@ -541,6 +582,16 @@ export async function main() {
     if(config.react)try{await message.react('🎁');}catch(error){log(`Auto reaction unavailable: ${error.name}`);}
     if(config.publish && message.channel.type===ChannelType.GuildAnnouncement)try{await message.crosspost();}catch(error){log(`Auto publish unavailable: ${error.name}`);}
     return message;
+  };
+  const recordPost=(config,game,message)=>{config.posts ??= {};const end=deadline(game);config.posts[offerKey(game)]={channel:message.channelId,id:message.id,end,title:game.title};};
+  const expirePosts=async config=>{for(const post of Object.values(config.posts || {})){if(!post.end || post.end>Date.now() || post.expired)continue;try{const channel=await client.channels.fetch(post.channel);const message=await channel.messages.fetch(post.id);await message.edit({content:`EXPIRED • ${text(post.title,200)}`,embeds:[],components:[],allowedMentions:{parse:[]}});post.expired=true;save();}catch(error){log(`Expired message update failed: ${error.name}`);}}};
+  const sendDigest=async(channel,config,games,window,deals)=>{
+    const active=games.filter(g=>!deadline(g) || deadline(g)>Date.now());
+    if(active.length){const lines=active.map(g=>`${g.title} — ${deals?g.price+' / '+g.discount+'% off':'Free offer'} — ${g.url || g.open_giveaway_url}`);
+      const sent=await sendConfigured(channel,{content:`Daily game digest • ${window.day} • ${active.length} new offers`,files:[new AttachmentBuilder(Buffer.from(lines.join('\n')),{name:'daily-game-digest.txt'})]},config,'Daily game digest');
+      for(const g of active){config.seen.push(deals?`${g.id}:${g.discount}:${g.price}`:offerKey(g));}
+    }
+    config.lastDigest=window.day;save();
   };
   const filterOffers=async(games,config)=>{
     const filtered=[];
@@ -572,9 +623,9 @@ export async function main() {
           settings.seen ??= []; settings.reminded ??= [];
           for (const game of games) {
             if (stopping || state.channels[guildId] !== settings) break;
-            const id = String(game.id);
-            if (!settings.seen.includes(id)) {
-              await channel.send({ embeds: [giveawayEmbed(game)], components: [...claimRows(game),new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId(`claimoffer:${id}`).setLabel('Mark claimed').setStyle(ButtonStyle.Success))] });
+            const id=offerKey(game);
+            if (!settings.seen.includes(id) && !settings.seen.includes(String(game.id))) {
+              await channel.send({ embeds: [giveawayEmbed(game)], components: [...claimRows(game),new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId(`claimoffer:${String(game.id)}`).setLabel('Mark claimed').setStyle(ButtonStyle.Success))] });
               settings.seen.push(id); save();
             }
             const end=deadline(game);
@@ -591,8 +642,12 @@ export async function main() {
             const channel = await client.channels.fetch(config.channel);
             if (!channel?.send) continue;
             config.seen ??= []; config.reminded ??= [];
+            await expirePosts(config);
+            const window=deliveryWindow(config);
+            if(window.quiet || (config.digest && !window.digestDue))continue;
             if (kind === 'deals') {
               const result = await sources.deals(1,'',config.minDiscount || 30,config.minPositive || 80,config.minReviews || 100);
+              if(config.digest){const fresh=result.games.filter(g=>!config.seen.includes(`${g.id}:${g.discount}:${g.price}`));await sendDigest(channel,config,fresh,window, true);continue;}
               for (const game of result.games.slice(0,10)) {
                 const key = `${game.id}:${game.discount}:${game.price}`;
                 if (config.seen.includes(key)) continue;
@@ -602,10 +657,11 @@ export async function main() {
               }
             } else {
               const games = await filterOffers(await sources.selectedGiveaways(config.platforms || [config.platform || 'all'],kind),config);
+              if(config.digest){const fresh=games.filter(g=>!config.seen.includes(offerKey(g)) && !config.seen.includes(String(g.id)));await sendDigest(channel,config,fresh,window,false);continue;}
               for (const game of games) {
-                const id=String(game.id);
-                const mark = new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId(`claimoffer:${id}`).setLabel('Mark claimed').setStyle(ButtonStyle.Success));
-                if (!config.seen.includes(id)) {await sendConfigured(channel,{...themedOffer(game,config),components:[...(config.links===false?[]:claimRows(game)),mark]},config,game.title);config.seen.push(id);save();}
+                const id=offerKey(game);
+                const mark = new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId(`claimoffer:${String(game.id)}`).setLabel('Mark claimed').setStyle(ButtonStyle.Success));
+                if (!config.seen.includes(id) && !config.seen.includes(String(game.id))) {const sent=await sendConfigured(channel,{...themedOffer(game,config),components:[...(config.links===false?[]:claimRows(game)),mark]},config,game.title);recordPost(config,game,sent);config.seen.push(id);save();}
                 const end=deadline(game), remaining=end-Date.now();
                 if (end && remaining > 0 && remaining <= (config.reminderHours || 6)*3600000 && !config.reminded.includes(id)) {
                   await channel.send({content:`⏰ Expiring soon: **${escapeMarkdown(game.title)}**. Reported deadline: ${game.end_date} (UTC assumed; verify claim page).`,components:claimRows(game)});
@@ -643,6 +699,14 @@ export async function main() {
     } catch(error) {log(`Background check failed: ${error.name}`);} finally { checking = false; }
   };
   client.on(Events.InteractionCreate, async i => {
+    if(i.isButton() && i.customId.startsWith('updates:')) {
+      await i.deferReply({flags:MessageFlags.Ephemeral});
+      const app=await client.application.fetch();if(i.user.id!==app.owner?.id){await i.editReply('Only the application owner can use update controls.');return;}
+      if(!process.send){await i.editReply('Restart using Start-Bot.bat to connect the supervisor.');return;}
+      const action=i.customId.split(':')[1];
+      await i.editReply(action==='rollback'?'Rollback requested; restarting with backup.':'Update check requested.');
+      process.send({type:action==='rollback'?'rollback':'update-check'});return;
+    }
     if(i.isButton() && i.customId.startsWith('subscription:')) {
       await i.reply({...subscriptionCard(i.customId.split(':')[1]),flags:MessageFlags.Ephemeral});return;
     }
@@ -653,7 +717,13 @@ export async function main() {
       try {
         if(action==='root'){await i.editReply(notificationHome(state.streams[guild] || {},guild));return;}
         if(action==='help'){await i.followUp({content:'Use /configure to choose a channel. Click an active notification category, then Filter Settings, Display Settings, Notification Settings or More. Personal preferences: /settings scope:personal. Thread/role/publish options require the relevant Discord permissions.',flags:MessageFlags.Ephemeral});return;}
-        const c=state.streams[guild]?.[kind];if(!c){await i.editReply({content:'Configure this stream first with /configure.',embeds:[],components:[]});return;}
+        const draftKey=`${guild}:${kind}:${i.user.id}`;
+        const saved=state.streams[guild]?.[kind];
+        if(saved && !drafts.has(draftKey))drafts.set(draftKey,structuredClone(saved));
+        const c=drafts.get(draftKey);if(!c){await i.editReply({content:'Configure this stream first with /configure.',embeds:[],components:[]});return;}
+        if(action==='save'){state.streams[guild][kind]=c;drafts.delete(draftKey);save();await i.editReply(notificationPanel(c,guild,kind));return;}
+        if(action==='cancel'){drafts.delete(draftKey);await i.editReply(notificationPanel(saved,guild,kind));return;}
+        if(action==='preview'){const sample={id:'preview',title:'Notification preview',type:'Game',worth:'$19.99',description:'Private preview — no server message, role ping, thread or publication is sent.',platforms:'Steam',end_date:'N/A',open_giveaway_url:'https://store.steampowered.com/'};await i.followUp({...themedOffer(sample,c),flags:MessageFlags.Ephemeral});return;}
         let tab='category';
         if(action.startsWith('tab-'))tab=action.slice(4);
         if(action==='store'){c.platforms=normalizeStores(i.values);c.platform=c.platforms[0];tab='filters';}
@@ -669,14 +739,14 @@ export async function main() {
         if(action==='addrole'){if(!i.memberPermissions.has(PermissionFlagsBits.ManageRoles))throw new Error('You need Manage Roles to create a role.');const role=await i.guild.roles.create({name:'Free Games',mentionable:true,reason:'Free games notification role requested by server manager'});c.role=role.id;tab='notifications';}
         if(action==='test'){const channel=await client.channels.fetch(c.channel);const sample={id:'test',title:'Test game notification',type:'Game',worth:'$19.99',description:'This is a test of your notification settings, not a real offer.',platforms:'Steam',end_date:'N/A',open_giveaway_url:'https://store.steampowered.com/'};await sendConfigured(channel,themedOffer(sample,c),c,'Test game notification',false);tab='more';}
         if(action==='resend'){c.seen=[];c.reminded=[];tab='more';}
-        save();await i.editReply(notificationPanel(c,guild,kind,tab));
+        drafts.set(draftKey,c);await i.editReply(notificationPanel(c,guild,kind,tab));
       }catch(error){await i.followUp({content:text(error.message,1500),flags:MessageFlags.Ephemeral});}
       return;
     }
     if ((i.isButton() || i.isStringSelectMenu()) && (i.customId.startsWith('settings:') || i.customId.startsWith('claimoffer:'))) {
       try {
         if(i.customId.startsWith('claimoffer:')) {
-          const id=i.customId.split(':')[1],p=profileFor(i.user.id);p.claimed ??= [];
+          const id=i.customId.slice('claimoffer:'.length),p=profileFor(i.user.id);p.claimed ??= [];
           if(!p.claimed.includes(id))p.claimed.push(id);save();
           await i.reply({content:'Marked claimed for you. Your /free browser will hide it.',flags:MessageFlags.Ephemeral});return;
         }
@@ -719,7 +789,7 @@ export async function main() {
     const cmd = i.commandName;
     // Discord requires an initial acknowledgement within three seconds.
     try {
-      const privateCommand=['settings','preferences','wishlist','claimed','configure','alerts','stopalerts','stores','notificationsettings','health','updates'].includes(cmd);
+      const privateCommand=['settings','preferences','wishlist','claimed','configure','alerts','stopalerts','stores','notificationsettings','health','updates','schedule','exportsettings','importsettings'].includes(cmd);
       await i.deferReply(privateCommand ? {flags:MessageFlags.Ephemeral} : {});
     } catch(error) {
       log(`Command ${cmd} acknowledgement failed: ${error.name}; run only one bot instance and check connection latency.`);
@@ -732,6 +802,28 @@ export async function main() {
     };
     try {
       const personal=profileFor(i.user.id);
+      if(['schedule','exportsettings','importsettings'].includes(cmd)) {
+        if(!i.inGuild() || !i.memberPermissions?.has(PermissionFlagsBits.ManageGuild)){await respond('Manage Server permission required.');return;}
+        if(cmd==='schedule') {
+          const kind=i.options.getString('type',true);state.streams[i.guildId] ??= {};
+          if(kind==='game' && !state.streams[i.guildId].game && state.channels[i.guildId])state.streams[i.guildId].game={...state.channels[i.guildId]};
+          const c=state.streams[i.guildId][kind];if(!c){await respond('Configure the stream first.');return;}
+          const timezone=i.options.getString('timezone') || c.timezone || 'America/Chicago';new Intl.DateTimeFormat('en-US',{timeZone:timezone});c.timezone=timezone;
+          for(const [opt,key] of [['quiet_start','quietStart'],['quiet_end','quietEnd'],['digest_hour','digestHour']]){const n=i.options.getInteger(opt);if(n!==null)c[key]=n;}
+          const digest=i.options.getBoolean('digest');if(digest!==null)c.digest=digest;save();await respond(`Schedule saved for ${kind} in ${timezone}. Digest: ${!!c.digest}. Quiet: ${c.quietStart ?? 'off'}–${c.quietEnd ?? 'off'}.`);return;
+        }
+        if(cmd==='exportsettings') {
+          const streams=state.streams[i.guildId] || {};const data={format:'freegames-settings-v1',streams:Object.fromEntries(Object.entries(streams).map(([k,c])=>[k,cleanConfig(c)]))};
+          if(!data.streams.game && state.channels[i.guildId])data.streams.game=cleanConfig(state.channels[i.guildId]);
+          await respond({content:'Server alert configuration only; no tokens, personal profiles or sent-message history.',files:[new AttachmentBuilder(Buffer.from(JSON.stringify(data,null,2)),{name:'freegames-settings.json'})]});return;
+        }
+        const attachment=i.options.getAttachment('file',true);if(attachment.size>200000)throw new Error('Settings export exceeds 200 KB');
+        const response=await fetch(attachment.url,{signal:AbortSignal.timeout(15000)});if(!response.ok)throw new Error('Could not download settings');
+        const data=JSON.parse(await response.text());if(data.format!=='freegames-settings-v1' || typeof data.streams!=='object')throw new Error('Invalid export format');
+        const imported={};const me=await i.guild.members.fetchMe();
+        for(const [kind,input] of Object.entries(data.streams)){if(!['game','loot','weekend','deals'].includes(kind))throw new Error('Invalid stream');const c=cleanConfig(input);const channel=await i.guild.channels.fetch(c.channel);if(!channel || !channel.permissionsFor(me)?.has([PermissionFlagsBits.ViewChannel,PermissionFlagsBits.SendMessages]))throw new Error('Imported channel missing or inaccessible; edit the exported channel IDs for this server.');if(c.role && !i.guild.roles.cache.has(c.role))throw new Error('Imported role not in this server');imported[kind]={...c,seen:[],reminded:[]};}
+        state.streams[i.guildId]={...(state.streams[i.guildId] || {}),...imported};save();await respond('Settings imported. Existing other streams retained; imported streams start fresh alert history.');return;
+      }
       if(cmd==='health') {
         const rows=[...sources.health].filter(([key])=>!key.startsWith('review')).slice(-20).map(([key,h])=>`${h.ok?'🟢':'🔴'} **${key}** — ${h.ok?(h.count===null?'OK':`${h.count} offers`):text(h.error,160)} • <t:${Math.floor(h.time/1000)}:R>`);
         await respond({embeds:[new EmbedBuilder().setTitle('Offer source health').setDescription(rows.join('\n') || 'No source checks yet. Run /free to load sources.').setFooter({text:'Recent fetches only; cached results are not a fresh connectivity test.'})]});return;
@@ -748,7 +840,7 @@ export async function main() {
         const pkg=JSON.parse(readFileSync(join(ROOT,'package.json'),'utf8'));
         let status={};try{status=JSON.parse(readFileSync(join(ROOT,'.update-status.json'),'utf8'));}catch{}
         let marker={};try{marker=JSON.parse(readFileSync(join(ROOT,'.update-version.json'),'utf8'));}catch{}
-        await respond({embeds:[new EmbedBuilder().setTitle('Live update status').setDescription(`Installed: **${pkg.version}**\nLatest observed: ${status.latest || 'Not checked'}\nLast check: ${status.checkedAt || 'Not checked'}\nResult: ${status.error || status.result || 'Unknown'}\nBackup: ${marker.backup?'Available':'None recorded'}\nSupervisor: ${process.send?'Connected':'Not running'}\nUse /updates action:check or rollback (application owner only).`)]});return;
+        await respond({components:[new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId('updates:check').setLabel('Check Updates').setStyle(ButtonStyle.Secondary),new ButtonBuilder().setCustomId('updates:rollback').setLabel('Restore Backup').setStyle(ButtonStyle.Danger).setDisabled(!marker.backup))],embeds:[new EmbedBuilder().setTitle('Live update status').setDescription(`Installed: **${pkg.version}**\nLatest observed: ${status.latest || 'Not checked'}\nLast check: ${status.checkedAt || 'Not checked'}\nResult: ${status.error || status.result || 'Unknown'}\nBackup: ${marker.backup?'Available':'None recorded'}\nSupervisor: ${process.send?'Connected':'Not running'}\nUse /updates action:check or rollback (application owner only).`)]});return;
       }
 
       if(cmd==='prime' || cmd==='gamepass'){await respond(subscriptionCard(cmd));return;}
