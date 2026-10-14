@@ -356,6 +356,7 @@ export function commandDefinitions() {
     .addStringOption(o=>o.setName('action').setDescription('Action').addChoices({name:'List',value:'list'},{name:'Clear all',value:'clear'}));
   const notificationsettings = new SlashCommandBuilder().setName('notificationsettings').setDescription('Server notification filters, display and test settings').setDMPermission(false).setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
     .addStringOption(o=>o.setName('type').setDescription('Stream').addChoices({name:'100% Discount',value:'game'},{name:'DLCs & More',value:'loot'},{name:'Steam deals',value:'deals'},{name:'Free Weekend (Steam)',value:'weekend'}));
+  const freedm=storeOption(new SlashCommandBuilder().setName('freedm').setDescription('Subscribe to free-game DMs or opt out').addStringOption(o=>o.setName('action').setDescription('Action').setRequired(true).addChoices({name:'Subscribe',value:'on'},{name:'Opt out of all game DMs',value:'off'},{name:'Status',value:'status'})));
   const history = new SlashCommandBuilder().setName('history').setDescription('View this server’s notification audit history').setDMPermission(false).setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
     .addIntegerOption(o=>o.setName('page').setDescription('20 entries per page').setMinValue(1).setMaxValue(15))
     .addStringOption(o=>o.setName('status').setDescription('Filter').addChoices(...['posted','skipped','failed','expired'].map(value=>({name:value,value}))))
@@ -389,7 +390,7 @@ export function commandDefinitions() {
   const exportsettings=new SlashCommandBuilder().setName('exportsettings').setDescription('Export this server’s alert configuration').setDMPermission(false).setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild);
   const importsettings=new SlashCommandBuilder().setName('importsettings').setDescription('Import server alert configuration from your export').setDMPermission(false).setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
     .addAttachmentOption(o=>o.setName('file').setDescription('JSON settings export').setRequired(true));
-  return [free, deals, giveaways, alerts, stop, settings, preferences, wishlist, claimed, configure, notificationsettings, history, diagnostics, health, updates, setup, checknow, schedule, exportsettings, importsettings, prime, gamepass, new SlashCommandBuilder().setName('stores').setDescription('List supported giveaway platforms')].map(c => {
+  return [free, deals, giveaways, alerts, stop, settings, preferences, wishlist, claimed, configure, notificationsettings, freedm, history, diagnostics, health, updates, setup, checknow, schedule, exportsettings, importsettings, prime, gamepass, new SlashCommandBuilder().setName('stores').setDescription('List supported giveaway platforms')].map(c => {
     const data=c.toJSON();
     delete data.dm_permission;
     const serverOnly=['alerts','stopalerts','configure','notificationsettings','schedule','exportsettings','importsettings','setup','checknow','history'].includes(data.name);
@@ -435,6 +436,20 @@ export async function diagnosticResults(sources,selected='all') {
     if(selected==='all' || key.startsWith(selected+'-'))sources.cache.delete(key);
   }
   return Promise.all(keys.map(async key=>{const started=Date.now();try{const games=await tests[key]();return {source:key,ok:true,count:games.length,elapsed:Date.now()-started};}catch(error){return {source:key,ok:false,error:text(error.message,180),advice:diagnosticAdvice(error),elapsed:Date.now()-started};}}));
+}
+export function setFreeDM(profile,enabled,store=null) {
+  profile.freeDM=!!enabled;profile.freeDMSeen ??= [];delete profile.freeDMPaused;
+  if(store!==null)profile.freeDMStores=normalizeStores([store]);
+  if(!enabled)profile.wishlistDM=false;
+}
+export function dmOffers(games,profile,now=Date.now()) {
+  const seen=new Set(profile.freeDMSeen || []),claimed=new Set(profile.claimed || []);
+  return games.filter(g=>g.type==='Game' && (!deadline(g) || deadline(g)>now)
+    && !seen.has(offerKey(g)) && !claimed.has(String(g.id))
+    && offerMatches(g,{...profile,stores:profile.freeDMStores || profile.stores || ['all']}));
+}
+export function freeDMControls() {
+  return new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId('freedm:off').setLabel('Stop all game DMs').setStyle(ButtonStyle.Secondary));
 }
 export function offerMatches(game, profile = {}) {
   const stores = profile.stores || ['all'];
@@ -487,9 +502,10 @@ export function settingsCard(profile, user) {
     {label:'Big discounts: 75% off, 80% positive, 100 reviews',value:'deep'});
   const buttons = new ActionRowBuilder().addComponents(
     new ButtonBuilder().setCustomId(`settings:${user}:hide`).setLabel(profile.hideClaimed !== false ? 'Show claimed offers' : 'Hide claimed offers').setStyle(ButtonStyle.Secondary),
-    new ButtonBuilder().setCustomId(`settings:${user}:dm`).setLabel(profile.wishlistDM ? 'Disable wishlist DMs' : 'Enable wishlist DMs').setStyle(ButtonStyle.Secondary));
+    new ButtonBuilder().setCustomId(`settings:${user}:dm`).setLabel(profile.wishlistDM ? 'Disable wishlist DMs' : 'Enable wishlist DMs').setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId(`settings:${user}:freedm`).setLabel(profile.freeDM?'Disable free-game DMs':'Enable free-game DMs').setStyle(ButtonStyle.Secondary));
   const embed = new EmbedBuilder().setTitle('Your game settings').setColor(0x5865F2).setDescription(
-    `Stores: ${(profile.stores || ['all']).map(k=>PLATFORMS[k]).join(', ')}\nGenre/keyword matches: ${(profile.keywords || []).join(', ') || 'All'}\nHide claimed: ${profile.hideClaimed !== false}\nWishlist DMs: ${!!profile.wishlistDM}\nDeal filters: ${profile.minDiscount || 30}% off, ${profile.minPositive || 80}% positive, ${profile.minReviews || 100} reviews\n\nUse /preferences keywords:survival,co-op to match genres/words in offer titles and descriptions. Use /configure for server alert channels.`);
+    `Stores: ${(profile.stores || ['all']).map(k=>PLATFORMS[k]).join(', ')}\nGenre/keyword matches: ${(profile.keywords || []).join(', ') || 'All'}\nHide claimed: ${profile.hideClaimed !== false}\nFree-game DMs: ${!!profile.freeDM}\nWishlist DMs: ${!!profile.wishlistDM}\nDeal filters: ${profile.minDiscount || 30}% off, ${profile.minPositive || 80}% positive, ${profile.minReviews || 100} reviews\n\nUse /preferences keywords:survival,co-op to match genres/words in offer titles and descriptions. Use /configure for server alert channels.`);
   return {embeds:[embed],components:[new ActionRowBuilder().addComponents(select),new ActionRowBuilder().addComponents(presets),buttons]};
 }
 
@@ -614,7 +630,7 @@ export async function main() {
   if (!state.channels || typeof state.channels !== 'object') throw new Error('Invalid state.json; restore a backup.');
   state.users ??= {}; state.streams ??= {};state.history ??= {};
   const audit=(guild,event)=>{if(!guild)return;addHistory(state.history,guild,event);save();};
-  const profileFor = user => state.users[user] ??= {stores:['all'],keywords:[],claimed:[],wishlist:[],wishlistSeen:[],hideClaimed:true,wishlistDM:false};
+  const profileFor = user => state.users[user] ??= {stores:['all'],keywords:[],claimed:[],wishlist:[],wishlistSeen:[],hideClaimed:true,wishlistDM:false,freeDM:false,freeDMSeen:[]};
   const save = () => { writeFileSync(statePath + '.tmp', JSON.stringify(state, null, 2)); renameSync(statePath + '.tmp', statePath); };
   const client = new Client({ intents: [GatewayIntentBits.Guilds], allowedMentions: { parse: [] } });
   const sources = new Sources(), cooldown = new Map(), sessions = new Map(), drafts=new Map(),wizards=new Map(),manualChecks=new Map();
@@ -733,6 +749,28 @@ export async function main() {
         }
       }
       // Personal wishlist notifications are opt-in, with a bounded rotating batch.
+      if(!targetGuild) {
+        const subscribers=Object.entries(state.users).filter(([,p])=>p.freeDM);
+        const start=(state.freeDMCursor || 0)%Math.max(subscribers.length,1);
+        for(let offset=0;offset<Math.min(30,subscribers.length);offset++) {
+          const [user,p]=subscribers[(start+offset)%subscribers.length];
+          try {
+            const games=await sources.selectedGiveaways(p.freeDMStores || p.stores || ['all'],'game');
+            const offers=dmOffers(games,p).slice(0,5);
+            if(!offers.length)continue;
+            const recipient=await client.users.fetch(user);
+            for(const game of offers) {
+              if(!p.freeDM)break;
+              await recipient.send({embeds:[giveawayEmbed(game)],components:[...claimRows(game),freeDMControls()],allowedMentions:{parse:[]}});
+              p.freeDMSeen ??= [];p.freeDMSeen.push(offerKey(game));p.freeDMSeen=p.freeDMSeen.slice(-1000);save();
+            }
+          }catch(error){
+            log(`Free-game DM failed: ${error.name}`);
+            if([50007,50001].includes(error.code)){setFreeDM(p,false);p.freeDMPaused='Discord blocked delivery. Allow DMs from this bot, then subscribe again.';save();}
+          }
+        }
+        if(subscribers.length){state.freeDMCursor=(start+Math.min(30,subscribers.length))%subscribers.length;save();}
+      }
       const watchers=(targetGuild?[]:Object.entries(state.users)).filter(([,p])=>p.wishlistDM && p.wishlist?.length);
       const allFree=watchers.length ? await sources.giveaways('all') : [];
       const jobs=watchers.flatMap(([user,p])=>p.wishlist.map(name=>({user,p,name})));
@@ -741,7 +779,7 @@ export async function main() {
         const {user,p,name}=jobs[(start+offset)%jobs.length];
         p.wishlistSeen ??= [];
           try {
-            const free=allFree.filter(g=>String(g.title).toLowerCase().includes(name.toLowerCase()) && !(p.claimed || []).includes(String(g.id)));
+            const free=allFree.filter(g=>String(g.title).toLowerCase().includes(name.toLowerCase()) && !(p.claimed || []).includes(String(g.id)) && !(p.freeDM && (p.freeDMSeen || []).includes(offerKey(g))));
             const deals=(await sources.deals(1,name,p.minDiscount || 30,p.minPositive || 80,p.minReviews || 100).catch(()=>({games:[]}))).games
               .filter(g=>g.title.toLowerCase().includes(name.toLowerCase()));
             const target=await client.users.fetch(user);
@@ -787,6 +825,10 @@ export async function main() {
         await i.editReply(setupCard(w,id));
       }catch(error){await i.followUp({content:text(error.message,1000),flags:MessageFlags.Ephemeral});}
       return;
+    }
+    if(i.isButton() && i.customId==='freedm:off') {
+      await i.deferReply({flags:MessageFlags.Ephemeral});const p=profileFor(i.user.id);setFreeDM(p,false);save();
+      await i.editReply('You opted out. Automatic free-game and wishlist DMs are disabled for you; server alerts are unchanged.');return;
     }
     if(i.isButton() && i.customId.startsWith('updates:')) {
       await i.deferReply({flags:MessageFlags.Ephemeral});
@@ -845,6 +887,7 @@ export async function main() {
         if(action==='stores')p.stores=i.values.filter(k=>Object.hasOwn(PLATFORMS,k));
         if(action==='hide')p.hideClaimed=p.hideClaimed===false;
         if(action==='dm')p.wishlistDM=!p.wishlistDM;
+        if(action==='freedm')setFreeDM(p,!p.freeDM);
         if(action==='deals') {
           const presets={standard:[30,80,100],strict:[50,90,500],deep:[75,80,100]};
           if(presets[i.values[0]])[p.minDiscount,p.minPositive,p.minReviews]=presets[i.values[0]];
@@ -878,7 +921,7 @@ export async function main() {
     const cmd = i.commandName;
     // Discord requires an initial acknowledgement within three seconds.
     try {
-      const privateCommand=['settings','preferences','wishlist','claimed','configure','alerts','stopalerts','stores','notificationsettings','health','updates','schedule','exportsettings','importsettings','setup','checknow','history','diagnostics'].includes(cmd);
+      const privateCommand=['settings','preferences','wishlist','claimed','configure','alerts','stopalerts','stores','notificationsettings','health','updates','schedule','exportsettings','importsettings','setup','checknow','history','diagnostics','freedm'].includes(cmd);
       await i.deferReply(privateCommand ? {flags:MessageFlags.Ephemeral} : {});
     } catch(error) {
       log(`Command ${cmd} acknowledgement failed: ${error.name}; run only one bot instance and check connection latency.`);
@@ -891,6 +934,18 @@ export async function main() {
     };
     try {
       const personal=profileFor(i.user.id);
+      if(cmd==='freedm') {
+        const action=i.options.getString('action',true),store=i.options.getString('store');
+        if(action==='off'){setFreeDM(personal,false);save();await respond('Opted out of automatic free-game and wishlist DMs. Server alerts are unchanged.');return;}
+        if(action==='on') {
+          if(personal.freeDM){if(store)setFreeDM(personal,true,store);save();await respond('Free-game DMs already enabled. Store preference updated if provided.');return;}
+          // Explicit subscription is required; delivery is tested before enabling.
+          try {const user=await client.users.fetch(i.user.id);await user.send({content:'Free-game DM subscription enabled. Current/new matching offers arrive on startup checks and every 30 minutes. Up to five offers per check; no auto redemption. You can opt out below or with /freedm action:off.',components:[freeDMControls()],allowedMentions:{parse:[]}});}
+          catch(error){personal.freeDMPaused='Discord blocked the subscription message. Enable DMs and retry.';save();await respond(personal.freeDMPaused);return;}
+          setFreeDM(personal,true,store);save();await respond('Subscribed to free-game DMs. Your first offers arrive on the next scheduled check. Use /freedm action:off or the Stop all game DMs button to opt out.');return;
+        }
+        await respond(`Free-game DMs: ${personal.freeDM?'Enabled':'Disabled'}\nStores: ${(personal.freeDMStores || personal.stores || ['all']).map(k=>PLATFORMS[k]).join(', ')}\n${personal.freeDMPaused || 'Off by default; enable only for your account.'}\nWishlist DMs: ${!!personal.wishlistDM}`);return;
+      }
       if(cmd==='setup' || cmd==='checknow') {
         if(!i.inGuild() || !i.memberPermissions?.has(PermissionFlagsBits.ManageGuild)){await respond('Manage Server permission required in a server.');return;}
         if(cmd==='setup'){for(const [id,w] of wizards)if(Date.now()-w.created>30*60000)wizards.delete(id);const id=randomUUID(),w={user:i.user.id,guild:i.guildId,created:Date.now(),step:0,kind:'game',config:{platforms:['all'],platform:'all',timezone:'America/Chicago',digest:false,digestHour:18,reminderHours:6,minDiscount:30,minPositive:80,minReviews:100}};wizards.set(id,w);await respond(setupCard(w,id));return;}

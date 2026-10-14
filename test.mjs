@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { parseSteam, parseDeals, qualifyReviews, withoutPlayStation, claimRows, steamRows, giveawayEmbed, Sources, commandDefinitions, parseState, paidGiveaway, offerCard, offerMatches, deadline, settingsCard, notificationPanel, themedOffer, subscriptionCard, normalizeStores, weekendOffer, offerKey, deliveryWindow, cleanConfig, setupCard, addHistory, diagnosticAdvice, diagnosticResults, steamGiveaway, epicGiveaways, gogGiveaways } from './bot.mjs';
+import { parseSteam, parseDeals, qualifyReviews, withoutPlayStation, claimRows, steamRows, giveawayEmbed, Sources, commandDefinitions, parseState, paidGiveaway, offerCard, offerMatches, deadline, settingsCard, notificationPanel, themedOffer, subscriptionCard, normalizeStores, weekendOffer, offerKey, deliveryWindow, cleanConfig, setupCard, addHistory, diagnosticAdvice, diagnosticResults, setFreeDM, dmOffers, freeDMControls, steamGiveaway, epicGiveaways, gogGiveaways } from './bot.mjs';
 const row = '<a class="search_result_row" data-ds-appid="10"><span class="title">Game</span><div class="discount_pct">-50%</div><div class="discount_original_price">$20.00</div><div class="discount_final_price">$10.00</div></a>';
 test('free rows exclude paid promotions and bundles', () => {
   const html = row + '<a class="search_result_row" data-ds-appid="570" data-price-final="0"><span class="title">Dota 2</span></a><a class="search_result_row" data-ds-appid="10,20" data-price-final="0"><span class="title">Bundle</span></a>';
@@ -57,7 +57,7 @@ test('deal review checks integrate with search and filters', async () => {
 });
 test('slash command schemas preserve commands and exclude PlayStation', () => {
   const commands=commandDefinitions();
-  assert.deepEqual(commands.map(c=>c.name),['free','deals','giveaways','alerts','stopalerts','settings','preferences','wishlist','claimed','configure','notificationsettings','history','diagnostics','health','updates','setup','checknow','schedule','exportsettings','importsettings','prime','gamepass','stores']);
+  assert.deepEqual(commands.map(c=>c.name),['free','deals','giveaways','alerts','stopalerts','settings','preferences','wishlist','claimed','configure','notificationsettings','freedm','history','diagnostics','health','updates','setup','checknow','schedule','exportsettings','importsettings','prime','gamepass','stores']);
   const alerts=commands.find(c=>c.name==='alerts');
   assert.equal(alerts.options[0].required,true);
   assert.ok(alerts.options.find(o=>o.name==='store').choices.every(c=>!c.value.startsWith('ps')));
@@ -288,4 +288,20 @@ test('diagnostics isolates failures, explains errors and invalidates direct cach
  assert.equal(sources.cache.has('steam-direct-free'),false);
  assert.match(diagnosticAdvice(new Error('response changed')),/parser/);
  assert.match(diagnosticAdvice(new Error('fetch failed')),/Connection/);
+});
+
+test('DM subscriptions are opt-in and opt-out disables all automatic game DMs',()=>{
+ const p={wishlistDM:true};assert.equal(p.freeDM,undefined);
+ setFreeDM(p,true,'steam');assert.equal(p.freeDM,true);assert.deepEqual(p.freeDMStores,['steam']);
+ p.freeDMSeen.push('one');setFreeDM(p,false);assert.equal(p.freeDM,false);assert.equal(p.wishlistDM,false);assert.deepEqual(p.freeDMSeen,['one']);
+ assert.equal(freeDMControls().toJSON().components[0].custom_id,'freedm:off');
+});
+test('DM offer selection applies preference, claimed, expiry and canonical sent history',()=>{
+ const now=Date.parse('2026-10-14T12:00:00Z');
+ const base={type:'Game',platforms:'Steam',title:'Survival',description:'co-op',open_giveaway_url:'https://store.steampowered.com/app/10/',end_date:'N/A'};
+ const games=[{...base,id:'1'},{...base,id:'2',open_giveaway_url:'https://store.steampowered.com/app/20/',end_date:'2020-01-01T00:00:00Z'},{...base,id:'3',type:'Free Weekend'},{...base,id:'4',platforms:'GOG',open_giveaway_url:'https://www.gog.com/en/game/test'}];
+ const p={freeDMStores:['steam'],keywords:['co-op'],claimed:[],freeDMSeen:[]};
+ assert.equal(dmOffers(games,p,now).length,1);
+ p.freeDMSeen=[offerKey(games[0])];assert.equal(dmOffers(games,p,now).length,0);
+ p.freeDMSeen=[];p.claimed=['1'];assert.equal(dmOffers(games,p,now).length,0);
 });
