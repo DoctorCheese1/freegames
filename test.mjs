@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { parseSteam, parseDeals, qualifyReviews, withoutPlayStation, claimRows, steamRows, giveawayEmbed, Sources, commandDefinitions, parseState, paidGiveaway, offerCard, offerMatches, deadline, settingsCard, notificationPanel, themedOffer, subscriptionCard, normalizeStores, weekendOffer, offerKey, deliveryWindow, cleanConfig, setupCard, steamGiveaway, epicGiveaways, gogGiveaways } from './bot.mjs';
+import { parseSteam, parseDeals, qualifyReviews, withoutPlayStation, claimRows, steamRows, giveawayEmbed, Sources, commandDefinitions, parseState, paidGiveaway, offerCard, offerMatches, deadline, settingsCard, notificationPanel, themedOffer, subscriptionCard, normalizeStores, weekendOffer, offerKey, deliveryWindow, cleanConfig, setupCard, addHistory, diagnosticAdvice, diagnosticResults, steamGiveaway, epicGiveaways, gogGiveaways } from './bot.mjs';
 const row = '<a class="search_result_row" data-ds-appid="10"><span class="title">Game</span><div class="discount_pct">-50%</div><div class="discount_original_price">$20.00</div><div class="discount_final_price">$10.00</div></a>';
 test('free rows exclude paid promotions and bundles', () => {
   const html = row + '<a class="search_result_row" data-ds-appid="570" data-price-final="0"><span class="title">Dota 2</span></a><a class="search_result_row" data-ds-appid="10,20" data-price-final="0"><span class="title">Bundle</span></a>';
@@ -57,7 +57,7 @@ test('deal review checks integrate with search and filters', async () => {
 });
 test('slash command schemas preserve commands and exclude PlayStation', () => {
   const commands=commandDefinitions();
-  assert.deepEqual(commands.map(c=>c.name),['free','deals','giveaways','alerts','stopalerts','settings','preferences','wishlist','claimed','configure','notificationsettings','health','updates','setup','checknow','schedule','exportsettings','importsettings','prime','gamepass','stores']);
+  assert.deepEqual(commands.map(c=>c.name),['free','deals','giveaways','alerts','stopalerts','settings','preferences','wishlist','claimed','configure','notificationsettings','history','diagnostics','health','updates','setup','checknow','schedule','exportsettings','importsettings','prime','gamepass','stores']);
   const alerts=commands.find(c=>c.name==='alerts');
   assert.equal(alerts.options[0].required,true);
   assert.ok(alerts.options.find(o=>o.name==='store').choices.every(c=>!c.value.startsWith('ps')));
@@ -132,7 +132,7 @@ test('account commands enable private/group DM contexts; admin commands stay ser
     assert.deepEqual(command.contexts,[0,1,2]);
     assert.equal(command.dm_permission,undefined);
   }
-  for(const name of ['alerts','configure','stopalerts','notificationsettings','schedule','exportsettings','importsettings','setup','checknow']) {
+  for(const name of ['alerts','configure','stopalerts','notificationsettings','schedule','exportsettings','importsettings','setup','checknow','history']) {
     const command=commands.find(c=>c.name===name);
     assert.deepEqual(command.integration_types,[0]);
     assert.deepEqual(command.contexts,[0]);
@@ -269,4 +269,23 @@ test('source failure schedules bounded retry and marks successful recovery',asyn
   assert.ok(source.health.get('steam-direct-free').recoveredAt);
   assert.equal(source.retryTimers.size,0);
  }finally{source.close();}
+});
+
+test('notification history is server isolated, age bounded and capacity bounded',()=>{
+ const history={a:[{time:1,status:'posted'}]};const now=40*86400000;
+ addHistory(history,'a',{status:'skipped',title:'Duplicate',reason:'Already posted',channel:'123'},now);
+ assert.equal(history.a.length,1);assert.equal(history.a[0].status,'skipped');
+ for(let i=0;i<305;i++)addHistory(history,'a',{status:'posted',title:String(i)},now+i);
+ assert.equal(history.a.length,300);assert.equal(history.a.at(-1).title,'304');
+ addHistory(history,'b',{status:'failed',title:'Network'},now);
+ assert.equal(history.b.length,1);assert.equal(history.a.length,300);
+});
+test('diagnostics isolates failures, explains errors and invalidates direct caches',async()=>{
+ const sources={cache:new Map([['steam-direct-free',{data:[]}]]),steamFree:async()=>[],epicFree:async()=>{throw new Error('Source HTTP 429');},gogFree:async()=>[{id:'one'}],feedOtherGames:async()=>[]};
+ const result=await diagnosticResults(sources);
+ assert.equal(result.length,4);assert.equal(result.find(r=>r.source==='steam').ok,true);
+ assert.equal(result.find(r=>r.source==='epic').ok,false);assert.match(result.find(r=>r.source==='epic').advice,/Rate limited/);
+ assert.equal(sources.cache.has('steam-direct-free'),false);
+ assert.match(diagnosticAdvice(new Error('response changed')),/parser/);
+ assert.match(diagnosticAdvice(new Error('fetch failed')),/Connection/);
 });
