@@ -1,5 +1,5 @@
 import { Client, Events, GatewayIntentBits, REST, Routes, SlashCommandBuilder, PermissionFlagsBits,
-  ChannelType, EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle, AttachmentBuilder, StringSelectMenuBuilder, RoleSelectMenuBuilder,
+  ChannelType, EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle, AttachmentBuilder, StringSelectMenuBuilder, RoleSelectMenuBuilder, ChannelSelectMenuBuilder,
   MessageFlags, escapeMarkdown } from 'discord.js';
 import { load } from 'cheerio';
 import dotenv from 'dotenv';
@@ -161,7 +161,7 @@ export function giveawayEmbed(game) {
 }
 
 export class Sources {
-  constructor(request = fetch) { this.request = request; this.cache = new Map(); this.inflight = new Map(); this.health = new Map(); }
+  constructor(request = fetch, options={}) { this.request=request;this.cache=new Map();this.inflight=new Map();this.health=new Map();this.retryTimers=new Map();this.retryAttempts=new Map();this.autoRetry=options.autoRetry!==false;this.retryDelayMs=options.retryDelayMs; }
   async json(address, params = {}, signal) {
     const url = new URL(address);
     for (const [key, value] of Object.entries(params)) url.searchParams.set(key, String(value));
@@ -183,7 +183,7 @@ export class Sources {
     const cached = this.cache.get(key);
     if (cached && Date.now() - cached.time < lifetime) return cached.data;
     if (this.inflight.has(key)) return this.inflight.get(key);
-    const pending = producer().then(data => { this.cache.set(key, { time: Date.now(), data }); this.health.set(key,{ok:true,time:Date.now(),count:Array.isArray(data)?data.length:null});return data; }).catch(error=>{this.health.set(key,{ok:false,time:Date.now(),error:error.message});throw error;});
+    const pending = producer().then(data => { this.cache.set(key, { time: Date.now(), data }); const old=this.health.get(key);this.health.set(key,{ok:true,time:Date.now(),count:Array.isArray(data)?data.length:null,recoveredAt:old?.ok===false?Date.now():old?.recoveredAt});if(old?.ok===false)log(`Offer source recovered: ${key}`);clearTimeout(this.retryTimers.get(key));this.retryTimers.delete(key);this.retryAttempts.delete(key);return data; }).catch(error=>{this.health.set(key,{ok:false,time:Date.now(),error:error.message});this.scheduleRetry(key,lifetime,producer);throw error;});
     this.inflight.set(key, pending);
     try { return await pending; } finally { this.inflight.delete(key); }
   }
@@ -198,6 +198,17 @@ export class Sources {
     if(!successes)throw new Error('All selected offer sources unavailable. Use /health for details.');
     return [...new Map(games.map(g=>[offerKey(g),g])).values()];
   }
+  scheduleRetry(key,lifetime,producer) {
+    if(!this.autoRetry || this.retryTimers.has(key) || !/^(steam-direct-free|epic-direct-free|gog-direct-free|steam-weekends|giveaways:)/.test(key))return;
+    const attempts=this.retryAttempts.get(key) || 0;
+    if(attempts>=5)return;
+    const wait=this.retryDelayMs ?? [60000,120000,300000,600000,900000][attempts];
+    this.retryAttempts.set(key,attempts+1);
+    const health=this.health.get(key) || {};this.health.set(key,{...health,nextRetry:Date.now()+wait,retryAttempt:attempts+1});
+    const timer=setTimeout(()=>{this.retryTimers.delete(key);void this.cached(key,lifetime,producer).catch(()=>{});},wait);
+    timer.unref?.();this.retryTimers.set(key,timer);
+  }
+  close(){for(const timer of this.retryTimers.values())clearTimeout(timer);this.retryTimers.clear();}
   async giveaways(platform = 'all', kind = 'game') {
     if (!Object.hasOwn(PLATFORMS, platform)) throw new Error('Unknown platform');
     if (!['game', 'loot', 'weekend'].includes(kind)) throw new Error('Unknown offer type');
@@ -360,6 +371,8 @@ export function commandDefinitions() {
   integer(configure,'min_positive','Minimum Steam positive reviews; default 80',100);
   integer(configure,'min_reviews','Minimum Steam review count; default 100',1000000);
   integer(configure,'reminder_hours','Expiry reminder lead time; default 6 hours',72);
+  const setup=new SlashCommandBuilder().setName('setup').setDescription('Guided server notification setup').setDMPermission(false).setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild);
+  const checknow=new SlashCommandBuilder().setName('checknow').setDescription('Check this server’s configured offers now').setDMPermission(false).setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild);
   const schedule=new SlashCommandBuilder().setName('schedule').setDescription('Quiet hours and daily digest for a server stream').setDMPermission(false).setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
     .addStringOption(o=>o.setName('type').setDescription('Stream').setRequired(true).addChoices(...['game','loot','weekend','deals'].map(value=>({name:value,value}))))
     .addStringOption(o=>o.setName('timezone').setDescription('IANA timezone; default America/Chicago').setMaxLength(80))
@@ -370,16 +383,29 @@ export function commandDefinitions() {
   const exportsettings=new SlashCommandBuilder().setName('exportsettings').setDescription('Export this server’s alert configuration').setDMPermission(false).setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild);
   const importsettings=new SlashCommandBuilder().setName('importsettings').setDescription('Import server alert configuration from your export').setDMPermission(false).setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
     .addAttachmentOption(o=>o.setName('file').setDescription('JSON settings export').setRequired(true));
-  return [free, deals, giveaways, alerts, stop, settings, preferences, wishlist, claimed, configure, notificationsettings, health, updates, schedule, exportsettings, importsettings, prime, gamepass, new SlashCommandBuilder().setName('stores').setDescription('List supported giveaway platforms')].map(c => {
+  return [free, deals, giveaways, alerts, stop, settings, preferences, wishlist, claimed, configure, notificationsettings, health, updates, setup, checknow, schedule, exportsettings, importsettings, prime, gamepass, new SlashCommandBuilder().setName('stores').setDescription('List supported giveaway platforms')].map(c => {
     const data=c.toJSON();
     delete data.dm_permission;
-    const serverOnly=['alerts','stopalerts','configure','notificationsettings','schedule','exportsettings','importsettings'].includes(data.name);
+    const serverOnly=['alerts','stopalerts','configure','notificationsettings','schedule','exportsettings','importsettings','setup','checknow'].includes(data.name);
     data.integration_types=serverOnly ? [0] : [0,1]; // Guild install, user install
     data.contexts=serverOnly ? [0] : [0,1,2]; // Guild, bot DM, private/group DM
     return data;
   });
 }
 
+export function setupCard(wizard,id) {
+  const c=wizard.config,step=wizard.step,prefix=`setup:${id}:`,rows=[];
+  const titles=['Choose notification type','Choose a channel','Choose stores','Choose delivery schedule','Choose notification role','Review and save'];
+  const embed=new EmbedBuilder().setTitle(`Setup • ${step+1}/6 • ${titles[step]}`).setColor(0x5865F2)
+    .setDescription(`Type: ${wizard.kind}\nChannel: ${c.channel?'<#'+c.channel+'>':'Not selected'}\nStores: ${(c.platforms || ['all']).map(k=>PLATFORMS[k]).join(', ')}\nDelivery: ${c.digest?'Daily digest at 18:00':c.quietStart===22?'Quiet 22:00–07:00':'Immediate alerts'} (${c.timezone})\nRole: ${c.role?'<@&'+c.role+'>':'No ping'}\n\nNothing is saved until Save Setup. Checks preserve quiet hours, sent history and digest limits. Temporary-access weekends are separate from free-to-keep offers.`);
+  if(step===0)rows.push(new ActionRowBuilder().addComponents(new StringSelectMenuBuilder().setCustomId(prefix+'type').setPlaceholder('Notification category').addOptions(...['game','loot','weekend','deals'].map(value=>({value,label:({game:'100% Discount',loot:'DLCs & More',weekend:'Free Weekend — Steam',deals:'Steam Deals'})[value],default:value===wizard.kind})))));
+  if(step===1)rows.push(new ActionRowBuilder().addComponents(new ChannelSelectMenuBuilder().setCustomId(prefix+'channel').setPlaceholder('Destination channel').addChannelTypes(ChannelType.GuildText,ChannelType.GuildAnnouncement)));
+  if(step===2)rows.push(new ActionRowBuilder().addComponents(new StringSelectMenuBuilder().setCustomId(prefix+'stores').setPlaceholder(wizard.kind==='deals'?'Deals use Steam only':'Select stores').setMinValues(1).setMaxValues(Object.keys(PLATFORMS).length).addOptions(...Object.entries(PLATFORMS).map(([value,label])=>({value,label,default:(c.platforms || ['all']).includes(value)})))));
+  if(step===3)rows.push(new ActionRowBuilder().addComponents(new StringSelectMenuBuilder().setCustomId(prefix+'schedule').setPlaceholder('Delivery preset (America/Chicago)').addOptions({label:'Immediate — check every 30 minutes',value:'immediate'},{label:'Quiet hours — 22:00 to 07:00',value:'quiet'},{label:'Daily digest — 18:00',value:'digest'})));
+  if(step===4)rows.push(new ActionRowBuilder().addComponents(new RoleSelectMenuBuilder().setCustomId(prefix+'role').setPlaceholder('Optional role ping — leave blank for none').setMinValues(0).setMaxValues(1)));
+  rows.push(new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId(prefix+'back').setLabel('Back').setStyle(ButtonStyle.Secondary).setDisabled(step===0),new ButtonBuilder().setCustomId(prefix+(step===5?'save':'next')).setLabel(step===5?'Save Setup':'Next').setStyle(step===5?ButtonStyle.Success:ButtonStyle.Primary).setDisabled(step===1&&!c.channel),new ButtonBuilder().setCustomId(prefix+'cancel').setLabel('Cancel').setStyle(ButtonStyle.Secondary)));
+  return {embeds:[embed],components:rows};
+}
 export function offerMatches(game, profile = {}) {
   const stores = profile.stores || ['all'];
   const platforms = String(game.platforms || '').toLowerCase();
@@ -560,7 +586,7 @@ export async function main() {
   const profileFor = user => state.users[user] ??= {stores:['all'],keywords:[],claimed:[],wishlist:[],wishlistSeen:[],hideClaimed:true,wishlistDM:false};
   const save = () => { writeFileSync(statePath + '.tmp', JSON.stringify(state, null, 2)); renameSync(statePath + '.tmp', statePath); };
   const client = new Client({ intents: [GatewayIntentBits.Guilds], allowedMentions: { parse: [] } });
-  const sources = new Sources(), cooldown = new Map(), sessions = new Map(), drafts=new Map();
+  const sources = new Sources(), cooldown = new Map(), sessions = new Map(), drafts=new Map(),wizards=new Map(),manualChecks=new Map();
   const browse = async (session, id) => {
     const all = await sources.giveaways('all',session.kind), profile = profileFor(session.user);
     const visible = all.filter(g => (profile.hideClaimed === false || !(profile.claimed || []).includes(String(g.id))) && offerMatches(g,{...profile,stores:['all']}));
@@ -608,11 +634,12 @@ export async function main() {
     return filtered;
   };
   let stopping = false, alertTimer, checking = false;
-  const checkAlerts = async () => {
-    if (checking || stopping) return;
+  const checkAlerts = async (targetGuild=null) => {
+    if (checking || stopping) return false;
     checking = true;
     try {
       for (const [guildId, settings] of Object.entries(state.channels)) {
+        if(targetGuild && guildId!==targetGuild)continue;
         if (stopping) break;
         if (state.channels[guildId] !== settings || state.streams[guildId]?.game) continue;
         const platform = settings.platform || 'steam';
@@ -636,6 +663,7 @@ export async function main() {
         } catch (error) { log(`Alerts for ${guildId}: ${error.name}: ${error.message}`); }
       }
       for (const [guild, streams] of Object.entries(state.streams)) {
+        if(targetGuild && guild!==targetGuild)continue;
         for (const [kind, config] of Object.entries(streams)) {
           if (stopping) break;
           try {
@@ -673,7 +701,7 @@ export async function main() {
         }
       }
       // Personal wishlist notifications are opt-in, with a bounded rotating batch.
-      const watchers=Object.entries(state.users).filter(([,p])=>p.wishlistDM && p.wishlist?.length);
+      const watchers=(targetGuild?[]:Object.entries(state.users)).filter(([,p])=>p.wishlistDM && p.wishlist?.length);
       const allFree=watchers.length ? await sources.giveaways('all') : [];
       const jobs=watchers.flatMap(([user,p])=>p.wishlist.map(name=>({user,p,name})));
       const start=(state.watchCursor || 0) % Math.max(jobs.length,1);
@@ -697,8 +725,37 @@ export async function main() {
       }
       if(jobs.length){state.watchCursor=(start+Math.min(10,jobs.length))%jobs.length;save();}
     } catch(error) {log(`Background check failed: ${error.name}`);} finally { checking = false; }
+    return true;
   };
   client.on(Events.InteractionCreate, async i => {
+    if((i.isButton() || i.isStringSelectMenu() || i.isChannelSelectMenu() || i.isRoleSelectMenu()) && i.customId.startsWith('setup:')) {
+      await i.deferUpdate();
+      try {
+        const [,id,action]=i.customId.split(':'),w=wizards.get(id);
+        if(!w || Date.now()-w.created>30*60000){await i.editReply({content:'Setup expired; run /setup again.',embeds:[],components:[]});return;}
+        if(w.user!==i.user.id || w.guild!==i.guildId || !i.memberPermissions?.has(PermissionFlagsBits.ManageGuild)){await i.followUp({content:'Only the server manager who opened setup can change it.',flags:MessageFlags.Ephemeral});return;}
+        const c=w.config;
+        if(action==='type' && ['game','loot','weekend','deals'].includes(i.values?.[0]))w.kind=i.values[0];
+        if(action==='channel'){const ch=await i.guild.channels.fetch(i.values[0]);const me=await i.guild.members.fetchMe();if(!ch?.permissionsFor(me)?.has([PermissionFlagsBits.ViewChannel,PermissionFlagsBits.SendMessages,PermissionFlagsBits.EmbedLinks,PermissionFlagsBits.AttachFiles]))throw new Error('Channel requires View, Send, Embed Links and Attach Files permissions for the bot.');c.channel=ch.id;}
+        if(action==='stores'){c.platforms=normalizeStores(i.values);c.platform=c.platforms[0];}
+        if(action==='schedule'){c.digest=i.values[0]==='digest';c.quietStart=i.values[0]==='quiet'?22:0;c.quietEnd=i.values[0]==='quiet'?7:0;c.digestHour=18;}
+        if(action==='role'){const role=i.values[0]?await i.guild.roles.fetch(i.values[0]):null;if(role && !role.mentionable && !i.guild.members.me?.permissions.has(PermissionFlagsBits.MentionEveryone))throw new Error('Choose a mentionable role or allow the bot to mention it.');c.role=role?.id || null;}
+        if(action==='back')w.step=Math.max(0,w.step-1);
+        if(action==='next'){if(w.step===1&&!c.channel)throw new Error('Select a destination channel.');w.step=Math.min(5,w.step+1);}
+        if(action==='cancel'){wizards.delete(id);await i.editReply({content:'Setup cancelled; no settings saved.',embeds:[],components:[]});return;}
+        if(action==='save') {
+          if(!c.channel)throw new Error('Select a destination channel.');
+          const ch=await i.guild.channels.fetch(c.channel),me=await i.guild.members.fetchMe();if(!ch?.permissionsFor(me)?.has([PermissionFlagsBits.ViewChannel,PermissionFlagsBits.SendMessages,PermissionFlagsBits.EmbedLinks,PermissionFlagsBits.AttachFiles]))throw new Error('Bot channel permissions changed; fix them before saving.');
+          if(c.role){const role=await i.guild.roles.fetch(c.role);if(!role || (!role.mentionable && !me.permissions.has(PermissionFlagsBits.MentionEveryone)))throw new Error('Notification role is no longer available/mentionable.');}
+          if(w.kind==='deals'){c.platform='steam';c.platforms=['steam'];}
+          if(w.kind==='weekend'){c.platform='steam';c.platforms=['steam'];}
+          state.streams[i.guildId] ??= {};const prior=state.streams[i.guildId][w.kind];state.streams[i.guildId][w.kind]={...prior,...c,seen:prior?.channel===c.channel?(prior.seen || []):[],reminded:prior?.channel===c.channel?(prior.reminded || []):[]};save();wizards.delete(id);
+          await i.editReply({content:`Setup saved for ${w.kind} in <#${c.channel}>. Use /checknow to check now, /schedule for custom hours/timezone, or /settings to edit.`,embeds:[],components:[]});return;
+        }
+        await i.editReply(setupCard(w,id));
+      }catch(error){await i.followUp({content:text(error.message,1000),flags:MessageFlags.Ephemeral});}
+      return;
+    }
     if(i.isButton() && i.customId.startsWith('updates:')) {
       await i.deferReply({flags:MessageFlags.Ephemeral});
       const app=await client.application.fetch();if(i.user.id!==app.owner?.id){await i.editReply('Only the application owner can use update controls.');return;}
@@ -789,7 +846,7 @@ export async function main() {
     const cmd = i.commandName;
     // Discord requires an initial acknowledgement within three seconds.
     try {
-      const privateCommand=['settings','preferences','wishlist','claimed','configure','alerts','stopalerts','stores','notificationsettings','health','updates','schedule','exportsettings','importsettings'].includes(cmd);
+      const privateCommand=['settings','preferences','wishlist','claimed','configure','alerts','stopalerts','stores','notificationsettings','health','updates','schedule','exportsettings','importsettings','setup','checknow'].includes(cmd);
       await i.deferReply(privateCommand ? {flags:MessageFlags.Ephemeral} : {});
     } catch(error) {
       log(`Command ${cmd} acknowledgement failed: ${error.name}; run only one bot instance and check connection latency.`);
@@ -802,6 +859,15 @@ export async function main() {
     };
     try {
       const personal=profileFor(i.user.id);
+      if(cmd==='setup' || cmd==='checknow') {
+        if(!i.inGuild() || !i.memberPermissions?.has(PermissionFlagsBits.ManageGuild)){await respond('Manage Server permission required in a server.');return;}
+        if(cmd==='setup'){for(const [id,w] of wizards)if(Date.now()-w.created>30*60000)wizards.delete(id);const id=randomUUID(),w={user:i.user.id,guild:i.guildId,created:Date.now(),step:0,kind:'game',config:{platforms:['all'],platform:'all',timezone:'America/Chicago',digest:false,digestHour:18,reminderHours:6,minDiscount:30,minPositive:80,minReviews:100}};wizards.set(id,w);await respond(setupCard(w,id));return;}
+        if(checking){await respond('An offer check is already running. Try again after it finishes.');return;}
+        const last=manualChecks.get(i.guildId) || 0;if(Date.now()-last<60000){await respond('Wait one minute between manual checks for this server.');return;}
+        if(!state.channels[i.guildId] && !Object.keys(state.streams[i.guildId] || {}).length){await respond('No alert streams configured. Run /setup first.');return;}
+        manualChecks.set(i.guildId,Date.now());for(const key of sources.cache.keys())if(!key.startsWith('review'))sources.cache.delete(key);
+        await checkAlerts(i.guildId);await respond('Check finished for this server. New matching offers were posted where available; quiet hours, digest schedules and duplicate protection still apply. Use /health to inspect source errors.');return;
+      }
       if(['schedule','exportsettings','importsettings'].includes(cmd)) {
         if(!i.inGuild() || !i.memberPermissions?.has(PermissionFlagsBits.ManageGuild)){await respond('Manage Server permission required.');return;}
         if(cmd==='schedule') {
@@ -825,7 +891,7 @@ export async function main() {
         state.streams[i.guildId]={...(state.streams[i.guildId] || {}),...imported};save();await respond('Settings imported. Existing other streams retained; imported streams start fresh alert history.');return;
       }
       if(cmd==='health') {
-        const rows=[...sources.health].filter(([key])=>!key.startsWith('review')).slice(-20).map(([key,h])=>`${h.ok?'🟢':'🔴'} **${key}** — ${h.ok?(h.count===null?'OK':`${h.count} offers`):text(h.error,160)} • <t:${Math.floor(h.time/1000)}:R>`);
+        const rows=[...sources.health].filter(([key])=>!key.startsWith('review')).slice(-20).map(([key,h])=>`${h.ok?'🟢':'🔴'} **${key}** — ${h.ok?(h.count===null?'OK':`${h.count} offers`):text(h.error,160)}${h.nextRetry?` • retry <t:${Math.floor(h.nextRetry/1000)}:R>`:''}${h.recoveredAt?' • recovered':''} • <t:${Math.floor(h.time/1000)}:R>`);
         await respond({embeds:[new EmbedBuilder().setTitle('Offer source health').setDescription(rows.join('\n') || 'No source checks yet. Run /free to load sources.').setFooter({text:'Recent fetches only; cached results are not a fresh connectivity test.'})]});return;
       }
       if(cmd==='updates') {
@@ -962,7 +1028,7 @@ export async function main() {
     } catch (error) { log(`Startup failed: ${error.name}${error.code ? ' code '+error.code : ''}: ${error.code===50001 ? 'Missing access. Check DISCORD_GUILD_ID and invite with bot + applications.commands. No Administrator permission needed.' : error.code===50035 ? 'Invalid registration settings. Enable User Install AND Guild Install under Developer Portal > Installation, then restart. See the setup guide.' : error.code===50013 ? 'Missing Discord permissions; check the bot role and channel permissions.' : error.message}`); client.destroy(); process.exitCode = 1; }
   });
   client.on(Events.Error, error => log(`Discord error: ${error.name}`));
-  for (const signal of ['SIGINT', 'SIGTERM']) process.once(signal, () => { stopping = true; clearInterval(alertTimer); client.destroy(); });
+  for (const signal of ['SIGINT', 'SIGTERM']) process.once(signal, () => { stopping = true; clearInterval(alertTimer);sources.close(); client.destroy(); });
   await client.login(token);
 }
 

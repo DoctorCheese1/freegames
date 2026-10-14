@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { parseSteam, parseDeals, qualifyReviews, withoutPlayStation, claimRows, steamRows, giveawayEmbed, Sources, commandDefinitions, parseState, paidGiveaway, offerCard, offerMatches, deadline, settingsCard, notificationPanel, themedOffer, subscriptionCard, normalizeStores, weekendOffer, offerKey, deliveryWindow, cleanConfig, steamGiveaway, epicGiveaways, gogGiveaways } from './bot.mjs';
+import { parseSteam, parseDeals, qualifyReviews, withoutPlayStation, claimRows, steamRows, giveawayEmbed, Sources, commandDefinitions, parseState, paidGiveaway, offerCard, offerMatches, deadline, settingsCard, notificationPanel, themedOffer, subscriptionCard, normalizeStores, weekendOffer, offerKey, deliveryWindow, cleanConfig, setupCard, steamGiveaway, epicGiveaways, gogGiveaways } from './bot.mjs';
 const row = '<a class="search_result_row" data-ds-appid="10"><span class="title">Game</span><div class="discount_pct">-50%</div><div class="discount_original_price">$20.00</div><div class="discount_final_price">$10.00</div></a>';
 test('free rows exclude paid promotions and bundles', () => {
   const html = row + '<a class="search_result_row" data-ds-appid="570" data-price-final="0"><span class="title">Dota 2</span></a><a class="search_result_row" data-ds-appid="10,20" data-price-final="0"><span class="title">Bundle</span></a>';
@@ -57,7 +57,7 @@ test('deal review checks integrate with search and filters', async () => {
 });
 test('slash command schemas preserve commands and exclude PlayStation', () => {
   const commands=commandDefinitions();
-  assert.deepEqual(commands.map(c=>c.name),['free','deals','giveaways','alerts','stopalerts','settings','preferences','wishlist','claimed','configure','notificationsettings','health','updates','schedule','exportsettings','importsettings','prime','gamepass','stores']);
+  assert.deepEqual(commands.map(c=>c.name),['free','deals','giveaways','alerts','stopalerts','settings','preferences','wishlist','claimed','configure','notificationsettings','health','updates','setup','checknow','schedule','exportsettings','importsettings','prime','gamepass','stores']);
   const alerts=commands.find(c=>c.name==='alerts');
   assert.equal(alerts.options[0].required,true);
   assert.ok(alerts.options.find(o=>o.name==='store').choices.every(c=>!c.value.startsWith('ps')));
@@ -132,7 +132,7 @@ test('account commands enable private/group DM contexts; admin commands stay ser
     assert.deepEqual(command.contexts,[0,1,2]);
     assert.equal(command.dm_permission,undefined);
   }
-  for(const name of ['alerts','configure','stopalerts','notificationsettings','schedule','exportsettings','importsettings']) {
+  for(const name of ['alerts','configure','stopalerts','notificationsettings','schedule','exportsettings','importsettings','setup','checknow']) {
     const command=commands.find(c=>c.name===name);
     assert.deepEqual(command.integration_types,[0]);
     assert.deepEqual(command.contexts,[0]);
@@ -247,4 +247,26 @@ test('settings export excludes runtime history and local secrets',()=>{
 test('expired offers remove claim links and label cards',()=>{
  const game={title:'Ended',type:'Game',worth:'$10.00',end_date:'2020-01-01T00:00:00Z',open_giveaway_url:'https://www.gog.com/en/game/test'};
  assert.equal(claimRows(game).length,0);assert.match(giveawayEmbed(game).toJSON().title,/EXPIRED/);
+});
+
+test('setup wizard provides six bounded pages and requires channel before proceeding',()=>{
+ const config={platforms:['steam'],timezone:'America/Chicago',channel:null};
+ for(let step=0;step<6;step++) {
+  const card=setupCard({step,kind:'game',config},'wizard-test');
+  assert.match(card.embeds[0].toJSON().title,new RegExp(`${step+1}/6`));
+  assert.ok(card.components.length<=5);
+  if(step===1)assert.equal(card.components.at(-1).toJSON().components[1].disabled,true);
+  if(step===5)assert.equal(card.components.at(-1).toJSON().components[1].label,'Save Setup');
+ }
+});
+test('source failure schedules bounded retry and marks successful recovery',async()=>{
+ const source=new Sources(fetch,{retryDelayMs:5});let attempts=0;
+ try {
+  await assert.rejects(source.cached('steam-direct-free',300000,async()=>{if(++attempts===1)throw new Error('temporary');return [{id:'recovered'}];}));
+  assert.equal(source.health.get('steam-direct-free').retryAttempt,1);
+  await new Promise(resolve=>setTimeout(resolve,40));
+  assert.equal(source.health.get('steam-direct-free').ok,true);
+  assert.ok(source.health.get('steam-direct-free').recoveredAt);
+  assert.equal(source.retryTimers.size,0);
+ }finally{source.close();}
 });
