@@ -3,7 +3,7 @@ import { Client, Events, GatewayIntentBits, REST, Routes, SlashCommandBuilder, P
   MessageFlags, escapeMarkdown } from 'discord.js';
 import { load } from 'cheerio';
 import dotenv from 'dotenv';
-import { readFileSync, writeFileSync, renameSync, existsSync, appendFileSync } from 'node:fs';
+import { readFileSync, writeFileSync, renameSync, existsSync, appendFileSync, mkdirSync, readdirSync, copyFileSync, unlinkSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join, resolve } from 'node:path';
 import { randomUUID } from 'node:crypto';
@@ -147,7 +147,7 @@ export function giveawayEmbed(game) {
     .setDescription(text(game.description, 1800) || 'Open the claim page for details.').setColor(0x57F287)
     .addFields(
       { name: 'Platforms', value: text(game.platforms, 200) || 'See claim page' },
-      { name: 'Offer', value: game.type==='Free Weekend'?'Free Weekend • temporary access, not yours to keep':game.type === 'Game' ? `100% discount • ${text(game.worth, 100)} → Free` : 'DLCs & More • Free offer' },
+      { name: 'Offer', value: game.type==='New Release'?`New ${game.releaseKind} release • ${game.priceText} • ${game.released}`:game.type==='Free Weekend'?'Free Weekend • temporary access, not yours to keep':game.type === 'Game' ? `100% discount • ${text(game.worth, 100)} → Free` : 'DLCs & More • Free offer' },
       { name: 'Claim instructions', value: text(game.instructions, 1000) || 'Open the claim page.' },
       { name: 'Ends (reported by source)', value: text(game.end_date, 100) || 'Unknown' },
       { name: 'Source', value: game.source==='Steam'?'[Steam Store](https://store.steampowered.com)':game.source==='Epic Games Store'?'[Epic Games Store](https://store.epicgames.com)':game.source==='GOG'?'[GOG](https://www.gog.com)':'[GamerPower](https://www.gamerpower.com)' })
@@ -211,8 +211,9 @@ export class Sources {
   close(){for(const timer of this.retryTimers.values())clearTimeout(timer);this.retryTimers.clear();}
   async giveaways(platform = 'all', kind = 'game') {
     if (!Object.hasOwn(PLATFORMS, platform)) throw new Error('Unknown platform');
-    if (!['game', 'loot', 'weekend'].includes(kind)) throw new Error('Unknown offer type');
+    if (!['game', 'loot', 'weekend','newfree','newpaid'].includes(kind)) throw new Error('Unknown offer type');
     return this.cached(`giveaways:${platform}:${kind}`, 300000, async () => {
+      if(kind==='newfree' || kind==='newpaid')return ['all','steam','pc'].includes(platform)?this.newReleases(kind==='newfree'?'free':'paid'):[];
       if(kind==='weekend')return ['all','steam','pc'].includes(platform)?this.freeWeekends():[];
       if(platform==='steam' && kind==='game')return this.steamFree();
       if(platform==='epic-games-store' && kind==='game')return this.epicFree();
@@ -236,6 +237,16 @@ export class Sources {
     const data=await this.json('https://www.gamerpower.com/api/giveaways',{type:'game','sort-by':'date'});
     if(!Array.isArray(data))throw new Error('Giveaway response changed');
     return data.filter(g=>paidGiveaway(g) && !/steam|epic|gog/i.test(String(g.platforms)));
+  }
+  async newReleases(kind='all',page=1) {
+    return this.cached(`newreleases:${kind}:${page}`,300000,async()=>{
+      const data=await this.json('https://store.steampowered.com/search/results/',{start:(page-1)*20,count:20,category1:998,sort_by:'Released_DESC',ignore_preferences:1,cc:process.env.STEAM_COUNTRY || 'US',l:'english',infinite:1,json:1});
+      if(typeof data?.results_html!=='string')throw new Error('Steam release search changed');
+      const $=load(data.results_html),ids=[];$('a.search_result_row').each((_,e)=>{const id=$(e).attr('data-ds-appid');if(/^\d+$/.test(id || '')&&!ids.includes(id))ids.push(id);});
+      const games=[];let next=0;
+      await Promise.all(Array.from({length:3},async()=>{while(next<ids.length){const id=ids[next++];try{const game=releaseGame(id,await this.json('https://store.steampowered.com/api/appdetails',{appids:id,cc:process.env.STEAM_COUNTRY || 'US',l:'english'}));if(game && (kind==='all' || game.releaseKind===kind))games.push(game);}catch(error){log(`Release details unavailable: ${error.name}`);}}}));
+      return games.sort((a,b)=>Date.parse(b.released)-Date.parse(a.released));
+    });
   }
   async freeWeekends() {
     return this.cached('steam-weekends',300000,async()=>{
@@ -320,7 +331,8 @@ export class Sources {
               { json: '1', language: 'all', filter: 'all', purchase_type: 'all', num_per_page: '1' }, signal);
             qualifyReviews(game, result, 0, 0); return result;
           });
-          const qualified = qualifyReviews(game, reviews, minPositive, minReviews);
+          let qualified = qualifyReviews(game, reviews, minPositive, minReviews);
+          if(qualified){try{const d=await this.json('https://store.steampowered.com/api/appdetails',{appids:game.id,cc:process.env.STEAM_COUNTRY || 'US',l:'english'},signal);const p=d?.[game.id]?.data?.price_overview;if(p)qualified={...qualified,priceData:{final:p.final,currency:p.currency,country:process.env.STEAM_COUNTRY || 'US'}};}catch{}}
           if (qualified) games.push(qualified);
         } catch { failures++; }
       }
@@ -355,7 +367,7 @@ export function commandDefinitions() {
   const claimed = new SlashCommandBuilder().setName('claimed').setDescription('View or clear your claimed offer tracking')
     .addStringOption(o=>o.setName('action').setDescription('Action').addChoices({name:'List',value:'list'},{name:'Clear all',value:'clear'}));
   const notificationsettings = new SlashCommandBuilder().setName('notificationsettings').setDescription('Server notification filters, display and test settings').setDMPermission(false).setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
-    .addStringOption(o=>o.setName('type').setDescription('Stream').addChoices({name:'100% Discount',value:'game'},{name:'DLCs & More',value:'loot'},{name:'Steam deals',value:'deals'},{name:'Free Weekend (Steam)',value:'weekend'}));
+    .addStringOption(o=>o.setName('type').setDescription('Stream').addChoices({name:'100% Discount',value:'game'},{name:'DLCs & More',value:'loot'},{name:'Steam deals',value:'deals'},{name:'Free Weekend (Steam)',value:'weekend'},{name:'New free Steam releases',value:'newfree'},{name:'New paid Steam releases',value:'newpaid'}));
   const freedm=storeOption(new SlashCommandBuilder().setName('freedm').setDescription('Subscribe to free-game DMs or opt out').addStringOption(o=>o.setName('action').setDescription('Action').setRequired(true).addChoices({name:'Subscribe',value:'on'},{name:'Opt out of all game DMs',value:'off'},{name:'Status',value:'status'})));
   const history = new SlashCommandBuilder().setName('history').setDescription('View this server’s notification audit history').setDMPermission(false).setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
     .addIntegerOption(o=>o.setName('page').setDescription('20 entries per page').setMinValue(1).setMaxValue(15))
@@ -370,7 +382,7 @@ export function commandDefinitions() {
   const gamepass = new SlashCommandBuilder().setName('gamepass').setDescription('Open official Xbox Game Pass catalog');
   const configure = new SlashCommandBuilder().setName('configure').setDescription('Configure separate free, DLC and deal alert channels')
     .setDMPermission(false).setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
-    .addStringOption(o=>o.setName('type').setDescription('Alert stream').setRequired(true).addChoices({name:'Free games',value:'game'},{name:'DLCs & More',value:'loot'},{name:'Steam deals',value:'deals'},{name:'Free Weekend (Steam)',value:'weekend'}))
+    .addStringOption(o=>o.setName('type').setDescription('Alert stream').setRequired(true).addChoices({name:'Free games',value:'game'},{name:'DLCs & More',value:'loot'},{name:'Steam deals',value:'deals'},{name:'Free Weekend (Steam)',value:'weekend'},{name:'New free Steam releases',value:'newfree'},{name:'New paid Steam releases',value:'newpaid'}))
     .addChannelOption(o=>o.setName('channel').setDescription('Destination channel').addChannelTypes(ChannelType.GuildText,ChannelType.GuildAnnouncement))
     .addBooleanOption(o=>o.setName('enabled').setDescription('False disables this stream'));
   storeOption(configure);
@@ -390,7 +402,18 @@ export function commandDefinitions() {
   const exportsettings=new SlashCommandBuilder().setName('exportsettings').setDescription('Export this server’s alert configuration').setDMPermission(false).setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild);
   const importsettings=new SlashCommandBuilder().setName('importsettings').setDescription('Import server alert configuration from your export').setDMPermission(false).setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
     .addAttachmentOption(o=>o.setName('file').setDescription('JSON settings export').setRequired(true));
-  return [free, deals, giveaways, alerts, stop, settings, preferences, wishlist, claimed, configure, notificationsettings, freedm, history, diagnostics, health, updates, setup, checknow, schedule, exportsettings, importsettings, prime, gamepass, new SlashCommandBuilder().setName('stores').setDescription('List supported giveaway platforms')].map(c => {
+  const newgames=new SlashCommandBuilder().setName('newgames').setDescription('New free/paid Steam releases from the last 30 days').addStringOption(o=>o.setName('type').setDescription('Price category').addChoices(...['all','free','paid'].map(value=>({name:value,value})))).addIntegerOption(o=>o.setName('page').setDescription('20 source candidates per page').setMinValue(1).setMaxValue(100));
+  const dmsettings=new SlashCommandBuilder().setName('dmsettings').setDescription('Personal DM quiet hours and weekly digest')
+    .addStringOption(o=>o.setName('timezone').setDescription('IANA timezone; default America/Chicago'))
+    .addIntegerOption(o=>o.setName('quiet_start').setDescription('Quiet start hour 0–23').setMinValue(0).setMaxValue(23))
+    .addIntegerOption(o=>o.setName('quiet_end').setDescription('Quiet end hour 0–23; same start/end disables').setMinValue(0).setMaxValue(23))
+    .addBooleanOption(o=>o.setName('weekly_digest').setDescription('One weekly free-game digest instead of individual posts'))
+    .addIntegerOption(o=>o.setName('day').setDescription('Weekly digest day: 0 Sunday to 6 Saturday').setMinValue(0).setMaxValue(6))
+    .addIntegerOption(o=>o.setName('hour').setDescription('Weekly digest hour; default 18').setMinValue(0).setMaxValue(23));
+  const exclude=new SlashCommandBuilder().setName('exclude').setDescription('Hide game names or genre words from personal results').addStringOption(o=>o.setName('words').setDescription('Comma-separated title/genre keywords; all clears exclusions').setRequired(true).setMaxLength(300));
+  const importwishlist=new SlashCommandBuilder().setName('importwishlist').setDescription('Import your public Steam wishlist by SteamID64').addStringOption(o=>o.setName('steamid').setDescription('17-digit SteamID64 (public wishlist only)').setRequired(true));
+  const pricehistory=new SlashCommandBuilder().setName('pricehistory').setDescription('Observed regional Steam price history since installation').addStringOption(o=>o.setName('appid').setDescription('Numeric Steam app ID').setRequired(true));
+  return [free, deals, giveaways, alerts, stop, settings, preferences, wishlist, claimed, configure, notificationsettings, freedm, newgames, dmsettings, exclude, importwishlist, pricehistory, history, diagnostics, health, updates, setup, checknow, schedule, exportsettings, importsettings, prime, gamepass, new SlashCommandBuilder().setName('stores').setDescription('List supported giveaway platforms')].map(c => {
     const data=c.toJSON();
     delete data.dm_permission;
     const serverOnly=['alerts','stopalerts','configure','notificationsettings','schedule','exportsettings','importsettings','setup','checknow','history'].includes(data.name);
@@ -437,19 +460,67 @@ export async function diagnosticResults(sources,selected='all') {
   }
   return Promise.all(keys.map(async key=>{const started=Date.now();try{const games=await tests[key]();return {source:key,ok:true,count:games.length,elapsed:Date.now()-started};}catch(error){return {source:key,ok:false,error:text(error.message,180),advice:diagnosticAdvice(error),elapsed:Date.now()-started};}}));
 }
+export function stateStore(directory) {
+  const file=join(directory,'state.json'),backups=join(directory,'.state-backups');
+  const valid=raw=>{const data=parseState(raw);if(!data || !data.channels || typeof data.channels!=='object' || Array.isArray(data.channels) || ['users','streams','history','prices'].some(k=>data[k]!==undefined && (typeof data[k]!=='object' || data[k]===null || Array.isArray(data[k]))))throw new Error('Invalid state structure');return data;};
+  function loadState(){
+    if(!existsSync(file))return {channels:{}};
+    try{return valid(readFileSync(file,'utf8'));}catch(error){
+      const names=existsSync(backups)?readdirSync(backups).filter(n=>/^state-.*\.json$/.test(n)).sort().reverse():[];
+      for(const name of names){try{const recovered=valid(readFileSync(join(backups,name),'utf8'));copyFileSync(file,join(directory,`state.corrupt-${Date.now()}.json`));writeFileSync(file,JSON.stringify(recovered));console.error('Recovered state.json from automatic backup.');return recovered;}catch{}}
+      throw new Error('state.json is invalid and no valid backup exists. Original retained; restore manually.');
+    }
+  }
+  function saveState(data){
+    valid(JSON.stringify(data));mkdirSync(backups,{recursive:true});
+    // Keep one valid snapshot per hour plus a valid previous snapshot before replacing live state.
+    const hour=new Date().toISOString().slice(0,13).replace(/:/g,'-'),snapshot=join(backups,`state-${hour}.json`);
+    if(!existsSync(snapshot)){if(existsSync(file)){try{valid(readFileSync(file,'utf8'));copyFileSync(file,snapshot);}catch{writeFileSync(snapshot,JSON.stringify(data));}}else writeFileSync(snapshot,JSON.stringify(data));}
+    writeFileSync(file+'.tmp',JSON.stringify(data,null,2));renameSync(file+'.tmp',file);
+    const names=readdirSync(backups).filter(n=>/^state-.*\.json$/.test(n)).sort().reverse();for(const name of names.slice(48))unlinkSync(join(backups,name));
+  }
+  return {load:loadState,save:saveState};
+}
+export function personalWindow(profile,now=new Date()) {
+  const parts=new Intl.DateTimeFormat('en-CA',{timeZone:profile.dmTimezone || 'America/Chicago',weekday:'short',year:'numeric',month:'2-digit',day:'2-digit',hour:'2-digit',hourCycle:'h23'}).formatToParts(now);
+  const get=k=>parts.find(p=>p.type===k).value,hour=Number(get('hour')),day=`${get('year')}-${get('month')}-${get('day')}`;
+  const start=profile.dmQuietStart,end=profile.dmQuietEnd,quiet=Number.isInteger(start)&&Number.isInteger(end)&&start!==end&&(start<end?hour>=start&&hour<end:hour>=start||hour<end);
+  const weekdays=['Sun','Mon','Tue','Wed','Thu','Fri','Sat'],weekday=weekdays.indexOf(get('weekday'));
+  return {quiet,day,weeklyDue:weekday===(profile.dmDigestDay ?? 0)&&hour>=(profile.dmDigestHour ?? 18)&&profile.dmDigestDate!==day};
+}
+export function excluded(game,profile) {
+  const haystack=`${game.title || ''} ${game.description || ''} ${(game.genres || []).join(' ')}`.toLowerCase();
+  return (profile.exclusions || []).some(word=>haystack.includes(word.toLowerCase()));
+}
+export function observePrice(prices,game,now=Date.now()) {
+  const p=game.priceData;if(!p || !Number.isFinite(p.final) || !p.currency)return null;
+  const key=`${game.id}:${p.currency}:${p.country || 'US'}`,entries=prices[key] || [];
+  const old=entries.filter(e=>e.time>=now-180*86400000),prior=old.length?Math.min(...old.map(e=>e.price)):null;
+  if(!old.length || old.at(-1).price!==p.final || now-old.at(-1).time>=86400000)old.push({time:now,price:p.final});
+  prices[key]=old.slice(-180);return {samples:old.length,low:Math.min(...old.map(e=>e.price)),newLow:prior!==null && p.final<prior};
+}
+export function releaseGame(id,payload,now=Date.now()) {
+  const d=payload?.[id]?.success?payload[id].data:null,stamp=Date.parse(d?.release_date?.date || ''),price=d?.price_overview;
+  if(!d || d.type!=='game' || d.release_date?.coming_soon || !Number.isFinite(stamp) || stamp>now || now-stamp>30*86400000)return null;
+  const free=d.is_free===true && (!price || price.final===0);
+  if(!free && (!price || !Number.isFinite(price.final)))return null;
+  return {id:`release:steam:${id}`,title:d.name,type:'New Release',status:'Active',source:'Steam',platforms:'PC, Steam',releaseKind:free?'free':'paid',released:d.release_date.date,
+    priceText:free?'Free to play':price.final_formatted || `${price.currency} ${(price.final/100).toFixed(2)}`,worth:price?.initial_formatted || 'Free to play',image:d.header_image,description:d.short_description || '',genres:(d.genres || []).map(g=>g.description),end_date:'N/A',open_giveaway_url:storeUrl(id),instructions:'New release listing, not a giveaway. Check store price and requirements.',priceData:price?{final:price.final,currency:price.currency,country:process.env.STEAM_COUNTRY || 'US'}:null};
+}
 export function setFreeDM(profile,enabled,store=null) {
   profile.freeDM=!!enabled;profile.freeDMSeen ??= [];delete profile.freeDMPaused;
   if(store!==null)profile.freeDMStores=normalizeStores([store]);
-  if(!enabled)profile.wishlistDM=false;
+  if(!enabled){profile.wishlistDM=false;profile.reminderDM=false;profile.dmQueue=[];}
 }
 export function dmOffers(games,profile,now=Date.now()) {
   const seen=new Set(profile.freeDMSeen || []),claimed=new Set(profile.claimed || []);
   return games.filter(g=>g.type==='Game' && (!deadline(g) || deadline(g)>now)
     && !seen.has(offerKey(g)) && !claimed.has(String(g.id))
-    && offerMatches(g,{...profile,stores:profile.freeDMStores || profile.stores || ['all']}));
+    && !excluded(g,profile) && offerMatches(g,{...profile,stores:profile.freeDMStores || profile.stores || ['all']}));
 }
-export function freeDMControls() {
-  return new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId('freedm:off').setLabel('Stop all game DMs').setStyle(ButtonStyle.Secondary));
+export function freeDMControls(reminderId=null) {
+  const row=new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId('freedm:off').setLabel('Stop all game DMs').setStyle(ButtonStyle.Secondary));
+  if(reminderId)row.addComponents(new ButtonBuilder().setCustomId('remind:'+reminderId).setLabel('Remind before expiry').setStyle(ButtonStyle.Secondary));return row;
 }
 export function offerMatches(game, profile = {}) {
   const stores = profile.stores || ['all'];
@@ -458,7 +529,7 @@ export function offerMatches(game, profile = {}) {
   const storeMatch = stores.includes('all') || stores.some(k => platforms.includes(storeNames[k] || k));
   const haystack = `${game.title || ''} ${game.description || ''}`.toLowerCase();
   const keywords = profile.keywords || [];
-  return storeMatch && (!keywords.length || keywords.some(k => haystack.includes(k.toLowerCase())));
+  return !excluded(game,profile) && storeMatch && (!keywords.length || keywords.some(k => haystack.includes(k.toLowerCase())));
 }
 export function offerKey(game) {
   try {
@@ -527,7 +598,9 @@ export function offerCard(games, session, sessionId) {
     new ButtonBuilder().setCustomId(`browse:${sessionId}:prev`).setLabel('Previous').setStyle(ButtonStyle.Secondary).setDisabled(index <= 0),
     new ButtonBuilder().setCustomId(`browse:${sessionId}:next`).setLabel('Next').setStyle(ButtonStyle.Secondary).setDisabled(index >= games.length - 1),
     new ButtonBuilder().setCustomId(`browse:${sessionId}:claimed`).setLabel('Mark claimed').setStyle(ButtonStyle.Success).setDisabled(!game),
+    new ButtonBuilder().setCustomId(`browse:${sessionId}:remind`).setLabel('Remind before expiry').setStyle(ButtonStyle.Secondary).setDisabled(!game || !deadline(game) || deadline(game)<=Date.now()),
     new ButtonBuilder().setCustomId(`browse:${sessionId}:claimlinks`).setLabel('All claim links').setStyle(ButtonStyle.Secondary).setDisabled(!games.length));
+  session.reminderOffer=game && deadline(game)?{key:offerKey(game),title:game.title,url:game.open_giveaway_url,end:deadline(game)}:null;
   session.claimLinks=games.slice(0,15).map(g=>`${text(g.title,90)} — ${g.open_giveaway_url}`).join('\n').slice(0,1900);
   session.current = game ? String(game.id) : null;
   return {embeds:[embed], components:[...(game ? claimRows(game) : []), new ActionRowBuilder().addComponents(stores), new ActionRowBuilder().addComponents(types), nav]};
@@ -548,19 +621,19 @@ export function normalizeStores(stores) {
   return !selected.length || selected.includes('all')?['all']:selected;
 }
 export function notificationHome(streams,guild) {
-  const labels={game:'🎁 100% Discount',loot:'📦 DLCs & More',deals:'💸 Steam Deals',weekend:'📅 Free Weekend'};
+  const labels={game:'🎁 100% Discount',loot:'📦 DLCs & More',newfree:'🆕 New Free Releases',newpaid:'🆕 New Paid Releases',deals:'💸 Steam Deals',weekend:'📅 Free Weekend'};
   const active=Object.keys(streams).filter(k=>labels[k]);
   const embed=new EmbedBuilder().setTitle('Your Active Notifications').setColor(0x5865F2)
     .setDescription(active.length?'Edit your notification settings by clicking a category below.':'No active notifications yet. Use /configure to select a channel.')
     .addFields({name:'Add Notifications',value:'Use /configure for 100% Discount, DLCs & More or Steam Deals. Prime Gaming and Game Pass: use the subscription buttons below. Live catalog notifications are not yet connected. Free Weekend uses a limited Steam store scan.'});
   const rows=[];
-  if(active.length)rows.push(new ActionRowBuilder().addComponents(...active.map(kind=>new ButtonBuilder().setCustomId(`notify:${guild}:${kind}:tab-category`).setLabel(labels[kind]).setStyle(ButtonStyle.Primary))));
+  for(let n=0;n<active.length;n+=5)rows.push(new ActionRowBuilder().addComponents(...active.slice(n,n+5).map(kind=>new ButtonBuilder().setCustomId(`notify:${guild}:${kind}:tab-category`).setLabel(labels[kind]).setStyle(ButtonStyle.Primary))));
   rows.push(new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId(`subscription:prime`).setLabel('👑 Prime Gaming').setStyle(ButtonStyle.Secondary),new ButtonBuilder().setCustomId(`subscription:gamepass`).setLabel('🎮 Game Pass').setStyle(ButtonStyle.Secondary)));
   rows.push(new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId(`notify:${guild}:game:help`).setLabel('Need help?').setStyle(ButtonStyle.Secondary)));
   return {embeds:[embed],components:rows};
 }
 export function notificationPanel(config,guild,kind,tab='category') {
-  const name=kind==='weekend'?'Free Weekend':kind==='game'?'100% Discount':kind==='loot'?'DLCs & More':'Steam Deals';
+  const name=kind==='newfree'?'New Free Releases':kind==='newpaid'?'New Paid Releases':kind==='weekend'?'Free Weekend':kind==='game'?'100% Discount':kind==='loot'?'DLCs & More':'Steam Deals';
   const title={category:'Settings',filters:'Filter Settings',display:'Display Settings',notifications:'Notification Settings',more:'More'};
   const prefix=`notify:${guild}:${kind}:`;
   const embed=new EmbedBuilder().setTitle(`${name} › ${title[tab] || 'Settings'}`).setColor(0x5865F2);
@@ -606,7 +679,7 @@ export function themedOffer(game,config={}) {
   let payload={embeds:[giveawayEmbed(game)],components:config.links===false?[]:claimRows(game)};
   const e=payload.embeds[0];
   if(['noimages','compact','simple','default'].includes(theme))e.setImage(null);
-  if(['simple','default','image'].includes(theme)) {e.setDescription(theme==='image'?'Free offer — open the claim page.':text(game.description,300) || 'Free offer');e.setFields({name:'Free until (source)',value:text(game.end_date,100)||'Unknown'});}
+  if(['simple','default','image'].includes(theme)) {e.setDescription(theme==='image'?game.type==='New Release'?'New release — check the store price.':'Free offer — open the claim page.':text(game.description,300) || (game.type==='New Release'?'New release':'Free offer'));e.setFields({name:game.type==='New Release'?'Release date':'Free until (source)',value:text(game.type==='New Release'?game.released:game.end_date,100)||'Unknown'});}
   if(theme==='advanced')e.addFields({name:'Offer ID',value:String(game.id ?? 'test')});
   if(['link','bare','text'].includes(theme)) {
     payload.embeds=[];
@@ -626,17 +699,26 @@ export async function main() {
   const token = process.env.DISCORD_TOKEN?.trim();
   if (!token || token === 'PASTE_YOUR_BOT_TOKEN_HERE') throw new Error('Edit .env and add DISCORD_TOKEN, then restart.');
   const statePath = join(ROOT, 'state.json');
-  const state = existsSync(statePath) ? parseState(readFileSync(statePath, 'utf8')) : { channels: {} };
+  const storage=stateStore(ROOT);const state=storage.load();
   if (!state.channels || typeof state.channels !== 'object') throw new Error('Invalid state.json; restore a backup.');
-  state.users ??= {}; state.streams ??= {};state.history ??= {};
+  state.users ??= {}; state.streams ??= {};state.history ??= {};state.prices ??= {};state.reminders ??= [];
   const audit=(guild,event)=>{if(!guild)return;addHistory(state.history,guild,event);save();};
   const profileFor = user => state.users[user] ??= {stores:['all'],keywords:[],claimed:[],wishlist:[],wishlistSeen:[],hideClaimed:true,wishlistDM:false,freeDM:false,freeDMSeen:[]};
-  const save = () => { writeFileSync(statePath + '.tmp', JSON.stringify(state, null, 2)); renameSync(statePath + '.tmp', statePath); };
+  const save=()=>storage.save(state);
   const client = new Client({ intents: [GatewayIntentBits.Guilds], allowedMentions: { parse: [] } });
-  const sources = new Sources(), cooldown = new Map(), sessions = new Map(), drafts=new Map(),wizards=new Map(),manualChecks=new Map();
+  const sources = new Sources(), cooldown = new Map(), sessions = new Map(), drafts=new Map(),reminderOffers=new Map(),wizards=new Map(),manualChecks=new Map();
+  const queueOrSend=async(profile,recipient,payload,end=null)=>{
+    if(!profile.dmWeekly)return recipient.send(payload);
+    profile.dmQueue ??= [];
+    if(profile.dmQueue.length>=300)throw new Error('Weekly DM queue is full; waiting for delivery');
+    const embed=payload.embeds?.[0]?.toJSON?.();
+    const links=(payload.components || []).flatMap(row=>(row.toJSON?.().components || []).map(button=>button.url).filter(Boolean));
+    const summary=[payload.content,embed?`${embed.title} — ${embed.url || ''}`:null,...links].filter(Boolean).join(' • ') || 'Game update';
+    profile.dmQueue.push({text:summary,end,created:Date.now()});save();return null;
+  };
   const browse = async (session, id) => {
     const all = await sources.giveaways('all',session.kind), profile = profileFor(session.user);
-    const visible = all.filter(g => (profile.hideClaimed === false || !(profile.claimed || []).includes(String(g.id))) && offerMatches(g,{...profile,stores:['all']}));
+    const visible = all.filter(g => !excluded(g,profile) && (profile.hideClaimed === false || !(profile.claimed || []).includes(String(g.id))) && offerMatches(g,{...profile,stores:['all']}));
     session.counts = Object.fromEntries(Object.keys(PLATFORMS).map(k=>[k,visible.filter(g=>offerMatches(g,{stores:[k]})).length]));
     let games = visible.filter(g=>offerMatches(g,{stores:session.store === 'all' ? profile.stores : [session.store]}));
     if (session.search) games = games.filter(g => String(g.title).toLowerCase().includes(session.search.toLowerCase()));
@@ -661,7 +743,7 @@ export async function main() {
   const expirePosts=async config=>{for(const post of Object.values(config.posts || {})){if(!post.end || post.end>Date.now() || post.expired)continue;try{const channel=await client.channels.fetch(post.channel);const message=await channel.messages.fetch(post.id);await message.edit({content:`EXPIRED • ${text(post.title,200)}`,embeds:[],components:[],allowedMentions:{parse:[]}});post.expired=true;audit(channel.guildId,{status:'expired',title:post.title,reason:'Known deadline passed; message controls removed',channel:post.channel});save();}catch(error){log(`Expired message update failed: ${error.name}`);}}};
   const sendDigest=async(channel,config,games,window,deals)=>{
     const active=games.filter(g=>!deadline(g) || deadline(g)>Date.now());
-    if(active.length){const lines=active.map(g=>`${g.title} — ${deals?g.price+' / '+g.discount+'% off':'Free offer'} — ${g.url || g.open_giveaway_url}`);
+    if(active.length){const lines=active.map(g=>`${g.title} — ${deals?g.price+' / '+g.discount+'% off':g.type==='New Release'?g.priceText:'Free offer'} — ${g.url || g.open_giveaway_url}`);
       const sent=await sendConfigured(channel,{content:`Daily game digest • ${window.day} • ${active.length} new offers`,files:[new AttachmentBuilder(Buffer.from(lines.join('\n')),{name:'daily-game-digest.txt'})]},config,'Daily game digest');
       for(const g of active){config.seen.push(deals?`${g.id}:${g.discount}:${g.price}`:offerKey(g));}
     }
@@ -685,6 +767,8 @@ export async function main() {
   const checkAlerts = async (targetGuild=null) => {
     if (checking || stopping) return false;
     checking = true;
+    for(const [id,offer] of reminderOffers)if(offer.end<=Date.now())reminderOffers.delete(id);
+    while(reminderOffers.size>2000)reminderOffers.delete(reminderOffers.keys().next().value);
     try {
       for (const [guildId, settings] of Object.entries(state.channels)) {
         if(targetGuild && guildId!==targetGuild)continue;
@@ -724,6 +808,7 @@ export async function main() {
             if (kind === 'deals') {
               const result = await sources.deals(1,'',config.minDiscount || 30,config.minPositive || 80,config.minReviews || 100);
               if(config.digest){const fresh=result.games.filter(g=>!config.seen.includes(`${g.id}:${g.discount}:${g.price}`));await sendDigest(channel,config,fresh,window, true);continue;}
+              for(const game of result.games)observePrice(state.prices,game);
               for (const game of result.games.slice(0,10)) {
                 const key = `${game.id}:${game.discount}:${game.price}`;
                 if(config.seen.includes(key)){audit(guild,{status:'skipped',title:game.title,reason:'Already posted this price/discount',channel:config.channel});continue;}
@@ -735,6 +820,7 @@ export async function main() {
               const games = await filterOffers(await sources.selectedGiveaways(config.platforms || [config.platform || 'all'],kind),config,guild);
               if(config.digest){const fresh=games.filter(g=>!config.seen.includes(offerKey(g)) && !config.seen.includes(String(g.id)));await sendDigest(channel,config,fresh,window,false);continue;}
               for (const game of games) {
+                if(game.priceData)observePrice(state.prices,{...game,id:game.id.replace('release:steam:','')});
                 const id=offerKey(game);
                 const mark = new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId(`claimoffer:${String(game.id)}`).setLabel('Mark claimed').setStyle(ButtonStyle.Success));
                 if (!config.seen.includes(id) && !config.seen.includes(String(game.id))) {const sent=await sendConfigured(channel,{...themedOffer(game,config),components:[...(config.links===false?[]:claimRows(game)),mark]},config,game.title);recordPost(config,game,sent);config.seen.push(id);save();}else audit(guild,{status:'skipped',title:game.title,reason:'Duplicate offer already posted',channel:config.channel});
@@ -755,13 +841,16 @@ export async function main() {
         for(let offset=0;offset<Math.min(30,subscribers.length);offset++) {
           const [user,p]=subscribers[(start+offset)%subscribers.length];
           try {
+            const window=personalWindow(p);if(window.quiet && !p.dmWeekly)continue;
             const games=await sources.selectedGiveaways(p.freeDMStores || p.stores || ['all'],'game');
-            const offers=dmOffers(games,p).slice(0,5);
+            const offers=dmOffers(games,p).slice(0,p.dmWeekly?100:5);
             if(!offers.length)continue;
             const recipient=await client.users.fetch(user);
+            if(p.dmWeekly){for(const game of offers){await queueOrSend(p,recipient,{content:`${game.title} — ${game.open_giveaway_url}`},deadline(game));p.freeDMSeen ??= [];p.freeDMSeen.push(offerKey(game));}p.freeDMSeen=p.freeDMSeen.slice(-1000);save();continue;}
             for(const game of offers) {
               if(!p.freeDM)break;
-              await recipient.send({embeds:[giveawayEmbed(game)],components:[...claimRows(game),freeDMControls()],allowedMentions:{parse:[]}});
+              const reminderId=randomUUID();if(deadline(game))reminderOffers.set(reminderId,{key:offerKey(game),title:game.title,url:game.open_giveaway_url,end:deadline(game)});
+              await recipient.send({embeds:[giveawayEmbed(game)],components:[...claimRows(game),freeDMControls(deadline(game)?reminderId:null)],allowedMentions:{parse:[]}});
               p.freeDMSeen ??= [];p.freeDMSeen.push(offerKey(game));p.freeDMSeen=p.freeDMSeen.slice(-1000);save();
             }
           }catch(error){
@@ -771,29 +860,67 @@ export async function main() {
         }
         if(subscribers.length){state.freeDMCursor=(start+Math.min(30,subscribers.length))%subscribers.length;save();}
       }
+      if(!targetGuild) {
+        for(const reminder of state.reminders.filter(r=>!r.sent)) {
+          const p=profileFor(reminder.user);if(p.reminderDM===false){reminder.sent=true;continue;}
+          if(reminder.end<=Date.now()){reminder.sent=true;continue;}
+          if(reminder.due>Date.now() || personalWindow(p).quiet)continue;
+          try{const u=await client.users.fetch(reminder.user);await u.send({content:`⏰ **${escapeMarkdown(reminder.title)}** expires <t:${Math.floor(reminder.end/1000)}:R>. ${reminder.url}`,components:[freeDMControls()],allowedMentions:{parse:[]}});reminder.sent=true;save();}catch(error){log(`Reminder delivery failed: ${error.name}`);}
+        }
+        state.reminders=state.reminders.filter(r=>r.end>Date.now()-7*86400000).slice(-2000);save();
+        const imported=Object.entries(state.users).filter(([,p])=>p.wishlistDM && p.steamWishlist?.length);
+        const cursor=(state.importCursor || 0)%Math.max(imported.length,1);
+        for(let offset=0;offset<Math.min(10,imported.length);offset++) {
+          const [user,p]=imported[(cursor+offset)%imported.length];if(personalWindow(p).quiet && !p.dmWeekly)continue;
+          let pos=p.steamWishlistCursor || 0;
+          for(let n=0;n<Math.min(5,p.steamWishlist.length);n++) {
+            const id=p.steamWishlist[(pos+n)%p.steamWishlist.length];
+            try{const d=await sources.json('https://store.steampowered.com/api/appdetails',{appids:id,cc:process.env.STEAM_COUNTRY || 'US',l:'english'}),g=d?.[id]?.data,price=g?.price_overview;if(!g || g.type!=='game' || !price || excluded({title:g.name,description:g.short_description,genres:(g.genres || []).map(x=>x.description)},p))continue;
+              const entry={id,title:g.name,priceData:{final:price.final,currency:price.currency,country:process.env.STEAM_COUNTRY || 'US'}};observePrice(state.prices,entry);
+              if(price.discount_percent<(p.minDiscount || 30) && price.final!==0)continue;
+              const reviews=await sources.json(`https://store.steampowered.com/appreviews/${id}`,{json:1,language:'all',filter:'all',purchase_type:'all',num_per_page:1});if(!qualifyReviews(entry,reviews,p.minPositive || 80,p.minReviews || 100))continue;
+              const key=`import:${id}:${price.final}`;p.wishlistSeen ??= [];if(p.wishlistSeen.includes(key))continue;
+              const u=await client.users.fetch(user);await queueOrSend(p,u,{content:`Steam wishlist match: **${escapeMarkdown(g.name)}** — ${price.final_formatted || price.final/100+' '+price.currency}, ${price.discount_percent}% off. ${storeUrl(id)}`,components:[freeDMControls()],allowedMentions:{parse:[]}});p.wishlistSeen.push(key);save();
+            }catch(error){log(`Imported wishlist check failed: ${error.name}`);}
+          }
+          p.steamWishlistCursor=(pos+5)%p.steamWishlist.length;save();
+        }
+        if(imported.length){state.importCursor=(cursor+10)%imported.length;save();}
+      }
       const watchers=(targetGuild?[]:Object.entries(state.users)).filter(([,p])=>p.wishlistDM && p.wishlist?.length);
       const allFree=watchers.length ? await sources.giveaways('all') : [];
       const jobs=watchers.flatMap(([user,p])=>p.wishlist.map(name=>({user,p,name})));
       const start=(state.watchCursor || 0) % Math.max(jobs.length,1);
       for(let offset=0;offset<Math.min(10,jobs.length);offset++) {
         const {user,p,name}=jobs[(start+offset)%jobs.length];
+        if(personalWindow(p).quiet && !p.dmWeekly)continue;
         p.wishlistSeen ??= [];
           try {
-            const free=allFree.filter(g=>String(g.title).toLowerCase().includes(name.toLowerCase()) && !(p.claimed || []).includes(String(g.id)) && !(p.freeDM && (p.freeDMSeen || []).includes(offerKey(g))));
+            const free=allFree.filter(g=>!excluded(g,p) && String(g.title).toLowerCase().includes(name.toLowerCase()) && !(p.claimed || []).includes(String(g.id)) && !(p.freeDM && (p.freeDMSeen || []).includes(offerKey(g))));
             const deals=(await sources.deals(1,name,p.minDiscount || 30,p.minPositive || 80,p.minReviews || 100).catch(()=>({games:[]}))).games
-              .filter(g=>g.title.toLowerCase().includes(name.toLowerCase()));
+              .filter(g=>!excluded(g,p) && g.title.toLowerCase().includes(name.toLowerCase()));
             const target=await client.users.fetch(user);
             for (const g of free) {
               const key=`free:${g.id}`;if(p.wishlistSeen.includes(key))continue;
-              await target.send({content:`Wishlist match: ${name}`,embeds:[giveawayEmbed(g)],components:claimRows(g)});p.wishlistSeen.push(key);save();
+              await queueOrSend(p,target,{content:`Wishlist match: ${name}`,embeds:[giveawayEmbed(g)],components:claimRows(g)},deadline(g));p.wishlistSeen.push(key);save();
             }
             for (const g of deals.slice(0,3)) {
               const key=`deal:${g.id}:${g.discount}:${g.price}`;if(p.wishlistSeen.includes(key))continue;
-              await target.send({content:`Wishlist discount: **${escapeMarkdown(g.title)}** — ${g.price}, ${g.discount}% off, ${g.positive.toFixed(1)}% positive.`,components:steamRows([g])});p.wishlistSeen.push(key);save();
+              await queueOrSend(p,target,{content:`Wishlist discount: **${escapeMarkdown(g.title)}** — ${g.price}, ${g.discount}% off, ${g.positive.toFixed(1)}% positive.`,components:steamRows([g])});p.wishlistSeen.push(key);save();
             }
           } catch(error) {log(`Wishlist notification failed: ${error.name}`);}
       }
       if(jobs.length){state.watchCursor=(start+Math.min(10,jobs.length))%jobs.length;save();}
+      if(!targetGuild) {
+        for(const [user,p] of Object.entries(state.users)) {
+          if(!p.dmQueue?.length)continue;
+          const window=personalWindow(p);if(window.quiet || (p.dmWeekly&&!window.weeklyDue))continue;
+          p.dmQueue=p.dmQueue.filter(q=>(!q.end || q.end>Date.now())&&q.created>Date.now()-30*86400000);
+          const batch=p.dmQueue.slice(0,100);
+          if(!batch.length){save();continue;}
+          try{const u=await client.users.fetch(user);await u.send({content:`${p.dmWeekly?'Weekly':'Pending'} game digest • ${batch.length} updates. Check current prices and expiry on the store.`,files:[new AttachmentBuilder(Buffer.from(batch.map(q=>q.text).join('\n')),{name:'game-digest.txt'})],components:[freeDMControls()],allowedMentions:{parse:[]}});p.dmQueue.splice(0,batch.length);p.dmDigestDate=window.day;save();}catch(error){log(`Weekly DM delivery failed: ${error.name}`);}
+        }
+      }
     } catch(error) {log(`Background check failed: ${error.name}`);} finally { checking = false; }
     return true;
   };
@@ -825,6 +952,15 @@ export async function main() {
         await i.editReply(setupCard(w,id));
       }catch(error){await i.followUp({content:text(error.message,1000),flags:MessageFlags.Ephemeral});}
       return;
+    }
+    if(i.isButton() && (i.customId.startsWith('remind:') || (i.customId.startsWith('browse:')&&i.customId.endsWith(':remind')))) {
+      await i.deferReply({flags:MessageFlags.Ephemeral});
+      const offer=i.customId.startsWith('remind:')?reminderOffers.get(i.customId.slice(7)):sessions.get(i.customId.split(':')[1])?.reminderOffer;
+      if(!offer || offer.end<=Date.now()){await i.editReply('No known future deadline, or this button expired after restart. Open /free again.');return;}
+      const p=profileFor(i.user.id);p.reminderDM=true;
+      if(state.reminders.filter(r=>r.user===i.user.id && !r.sent && r.end>Date.now()).length>=20){await i.editReply('You already have 20 pending reminders. Wait for one to finish.');return;}
+      if(!state.reminders.some(r=>r.user===i.user.id && r.key===offer.key && !r.sent))state.reminders.push({...offer,user:i.user.id,due:Math.max(Date.now(),offer.end-6*3600000),sent:false});
+      save();await i.editReply('Personal reminder saved for approximately six hours before expiry (30-minute checks). Quiet hours apply; unknown deadlines cannot be reminded. Use /freedm action:off to cancel game DMs.');return;
     }
     if(i.isButton() && i.customId==='freedm:off') {
       await i.deferReply({flags:MessageFlags.Ephemeral});const p=profileFor(i.user.id);setFreeDM(p,false);save();
@@ -921,7 +1057,7 @@ export async function main() {
     const cmd = i.commandName;
     // Discord requires an initial acknowledgement within three seconds.
     try {
-      const privateCommand=['settings','preferences','wishlist','claimed','configure','alerts','stopalerts','stores','notificationsettings','health','updates','schedule','exportsettings','importsettings','setup','checknow','history','diagnostics','freedm'].includes(cmd);
+      const privateCommand=['settings','preferences','wishlist','claimed','configure','alerts','stopalerts','stores','notificationsettings','health','updates','schedule','exportsettings','importsettings','setup','checknow','history','diagnostics','freedm','dmsettings','exclude','importwishlist','pricehistory'].includes(cmd);
       await i.deferReply(privateCommand ? {flags:MessageFlags.Ephemeral} : {});
     } catch(error) {
       log(`Command ${cmd} acknowledgement failed: ${error.name}; run only one bot instance and check connection latency.`);
@@ -934,6 +1070,31 @@ export async function main() {
     };
     try {
       const personal=profileFor(i.user.id);
+      if(['importwishlist','pricehistory','newgames'].includes(cmd)){const key=`${cmd}:${i.user.id}`,until=cooldown.get(key) || 0;if(until>Date.now()){await respond('Wait 30 seconds before running this command again.');return;}cooldown.set(key,Date.now()+30000);}
+      if(cmd==='dmsettings') {
+        const tz=i.options.getString('timezone') || personal.dmTimezone || 'America/Chicago';new Intl.DateTimeFormat('en-US',{timeZone:tz});personal.dmTimezone=tz;
+        for(const [opt,key] of [['quiet_start','dmQuietStart'],['quiet_end','dmQuietEnd'],['day','dmDigestDay'],['hour','dmDigestHour']]){const value=i.options.getInteger(opt);if(value!==null)personal[key]=value;}
+        const weekly=i.options.getBoolean('weekly_digest');if(weekly!==null)personal.dmWeekly=weekly;save();await respond(`DM settings saved: ${tz}, quiet ${personal.dmQuietStart ?? 'off'}–${personal.dmQuietEnd ?? 'off'}, weekly free-game digest ${!!personal.dmWeekly}. Subscription remains opt-in with /freedm.`);return;
+      }
+      if(cmd==='exclude'){const words=i.options.getString('words',true);personal.exclusions=words.toLowerCase()==='all'?[]:words.split(',').map(x=>x.trim()).filter(Boolean).slice(0,20);save();await respond('Personal exclusions saved. Matches use titles, descriptions and available genre words.');return;}
+      if(cmd==='importwishlist') {
+        const id=i.options.getString('steamid',true);if(!/^765\d{14}$/.test(id)){await respond('Provide a 17-digit SteamID64; no password or session token is needed.');return;}
+        const data=await sources.json('https://api.steampowered.com/IWishlistService/GetWishlist/v1/',{steamid:id});
+        const items=data?.response?.items;if(!Array.isArray(items)){await respond('Wishlist is private, unavailable, empty, or the endpoint changed. Existing watches were retained. Set Steam Game details/wishlist public and retry.');return;}
+        personal.steamWishlist=[...new Set(items.map(x=>String(x.appid)).filter(x=>/^\d+$/.test(x)))].slice(0,1000);personal.steamWishlistCursor=0;save();await respond(`Imported ${personal.steamWishlist.length} Steam app IDs. Enable wishlist DMs in /settings scope:personal for alerts. Checks rotate through up to five imported games per user per cycle.`);return;
+      }
+      if(cmd==='pricehistory') {
+        const id=i.options.getString('appid',true);if(!/^\d+$/.test(id))throw new Error('Numeric Steam app ID required');
+        const data=await sources.json('https://store.steampowered.com/api/appdetails',{appids:id,cc:process.env.STEAM_COUNTRY || 'US',l:'english'}),g=data?.[id]?.data,p=g?.price_overview;
+        if(!p){await respond('No paid regional price reported for that app.');return;}
+        const history=observePrice(state.prices,{id,priceData:{final:p.final,currency:p.currency,country:process.env.STEAM_COUNTRY || 'US'}});save();await respond(`**${g.name}** — ${p.final_formatted}\nLowest observed: ${(history.low/100).toFixed(2)} ${p.currency} • ${history.samples} observations (up to 180 days). ${history.newLow?'New observed low.':'This is not an all-time price history.'}`);return;
+      }
+      if(cmd==='newgames') {
+        const games=(await sources.newReleases(i.options.getString('type') || 'all',i.options.getInteger('page') || 1)).filter(g=>!excluded(g,personal));
+        for(const g of games)observePrice(state.prices,{...g,id:g.id.replace('release:steam:','')});save();
+        const lines=games.slice(0,15).map(g=>`**[${escapeMarkdown(g.title)}](${g.open_giveaway_url})** — ${g.priceText} • released ${g.released}`);
+        await respond({embeds:[new EmbedBuilder().setTitle('New Steam releases • last 30 days').setDescription(lines.join('\n').slice(0,4000) || 'No verified releases matched this source page.').setFooter({text:'20 source candidates per page; free and paid releases are not giveaway claims.'})]});return;
+      }
       if(cmd==='freedm') {
         const action=i.options.getString('action',true),store=i.options.getString('store');
         if(action==='off'){setFreeDM(personal,false);save();await respond('Opted out of automatic free-game and wishlist DMs. Server alerts are unchanged.');return;}
@@ -974,7 +1135,7 @@ export async function main() {
         const response=await fetch(attachment.url,{signal:AbortSignal.timeout(15000)});if(!response.ok)throw new Error('Could not download settings');
         const data=JSON.parse(await response.text());if(data.format!=='freegames-settings-v1' || typeof data.streams!=='object')throw new Error('Invalid export format');
         const imported={};const me=await i.guild.members.fetchMe();
-        for(const [kind,input] of Object.entries(data.streams)){if(!['game','loot','weekend','deals'].includes(kind))throw new Error('Invalid stream');const c=cleanConfig(input);const channel=await i.guild.channels.fetch(c.channel);if(!channel || !channel.permissionsFor(me)?.has([PermissionFlagsBits.ViewChannel,PermissionFlagsBits.SendMessages]))throw new Error('Imported channel missing or inaccessible; edit the exported channel IDs for this server.');if(c.role && !i.guild.roles.cache.has(c.role))throw new Error('Imported role not in this server');imported[kind]={...c,seen:[],reminded:[]};}
+        for(const [kind,input] of Object.entries(data.streams)){if(!['game','loot','weekend','deals','newfree','newpaid'].includes(kind))throw new Error('Invalid stream');const c=cleanConfig(input);const channel=await i.guild.channels.fetch(c.channel);if(!channel || !channel.permissionsFor(me)?.has([PermissionFlagsBits.ViewChannel,PermissionFlagsBits.SendMessages]))throw new Error('Imported channel missing or inaccessible; edit the exported channel IDs for this server.');if(c.role && !i.guild.roles.cache.has(c.role))throw new Error('Imported role not in this server');imported[kind]={...c,seen:[],reminded:[]};}
         state.streams[i.guildId]={...(state.streams[i.guildId] || {}),...imported};save();await respond('Settings imported. Existing other streams retained; imported streams start fresh alert history.');return;
       }
       if(cmd==='history') {
@@ -1099,8 +1260,8 @@ export async function main() {
         await i.editReply(await browse(session,id));
       } else if (cmd === 'deals') {
         const discount = i.options.getInteger('min_discount') || personal.minDiscount || 30, positive = i.options.getInteger('min_positive') || personal.minPositive || 80, reviews = i.options.getInteger('min_reviews') || personal.minReviews || 100;
-        const result = await sources.deals(page, search, discount, positive, reviews);
-        let description = result.games.slice(0,10).map(g => `**[${escapeMarkdown(text(g.title,130))}](${g.url})**\n${g.price} (was ${g.original}) • **${g.discount}% off**\n${g.positive.toFixed(1)}% positive • ${g.reviews.toLocaleString()} reviews`).join('\n\n') || 'No matches on this sale page. Try the next page or lower your thresholds.';
+        const result = await sources.deals(page, search, discount, positive, reviews);result.games=result.games.filter(g=>!excluded(g,personal));for(const g of result.games){const h=observePrice(state.prices,g);if(h)g.observedLow=h.newLow;}save();
+        let description = result.games.slice(0,10).map(g => `**[${escapeMarkdown(text(g.title,130))}](${g.url})**\n${g.price} (was ${g.original}) • **${g.discount}% off**${g.observedLow?' • New observed low':''}\n${g.positive.toFixed(1)}% positive • ${g.reviews.toLocaleString()} reviews`).join('\n\n') || 'No matches on this sale page. Try the next page or lower your thresholds.';
         if (result.failures) description += `\n\nReview checks unavailable for ${result.failures} candidates; omitted.`;
         const embed = new EmbedBuilder().setTitle(`Good Steam deals • page ${page}`).setColor(0xF1C40F).setDescription(description.slice(0,4000))
           .setFooter({ text: `${discount}%+ off • ${positive}%+ positive • ${reviews}+ reviews • ${result.total.toLocaleString()} sale matches before filtering • regional prices` });

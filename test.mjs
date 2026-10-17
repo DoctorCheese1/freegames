@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { parseSteam, parseDeals, qualifyReviews, withoutPlayStation, claimRows, steamRows, giveawayEmbed, Sources, commandDefinitions, parseState, paidGiveaway, offerCard, offerMatches, deadline, settingsCard, notificationPanel, themedOffer, subscriptionCard, normalizeStores, weekendOffer, offerKey, deliveryWindow, cleanConfig, setupCard, addHistory, diagnosticAdvice, diagnosticResults, setFreeDM, dmOffers, freeDMControls, steamGiveaway, epicGiveaways, gogGiveaways } from './bot.mjs';
+import { parseSteam, parseDeals, qualifyReviews, withoutPlayStation, claimRows, steamRows, giveawayEmbed, Sources, commandDefinitions, parseState, paidGiveaway, offerCard, offerMatches, deadline, settingsCard, notificationPanel, themedOffer, subscriptionCard, normalizeStores, weekendOffer, offerKey, deliveryWindow, cleanConfig, setupCard, addHistory, diagnosticAdvice, diagnosticResults, setFreeDM, dmOffers, freeDMControls, personalWindow, excluded, observePrice, releaseGame, stateStore, notificationHome, steamGiveaway, epicGiveaways, gogGiveaways } from './bot.mjs';
 const row = '<a class="search_result_row" data-ds-appid="10"><span class="title">Game</span><div class="discount_pct">-50%</div><div class="discount_original_price">$20.00</div><div class="discount_final_price">$10.00</div></a>';
 test('free rows exclude paid promotions and bundles', () => {
   const html = row + '<a class="search_result_row" data-ds-appid="570" data-price-final="0"><span class="title">Dota 2</span></a><a class="search_result_row" data-ds-appid="10,20" data-price-final="0"><span class="title">Bundle</span></a>';
@@ -57,7 +57,7 @@ test('deal review checks integrate with search and filters', async () => {
 });
 test('slash command schemas preserve commands and exclude PlayStation', () => {
   const commands=commandDefinitions();
-  assert.deepEqual(commands.map(c=>c.name),['free','deals','giveaways','alerts','stopalerts','settings','preferences','wishlist','claimed','configure','notificationsettings','freedm','history','diagnostics','health','updates','setup','checknow','schedule','exportsettings','importsettings','prime','gamepass','stores']);
+  assert.deepEqual(commands.map(c=>c.name),['free','deals','giveaways','alerts','stopalerts','settings','preferences','wishlist','claimed','configure','notificationsettings','freedm','newgames','dmsettings','exclude','importwishlist','pricehistory','history','diagnostics','health','updates','setup','checknow','schedule','exportsettings','importsettings','prime','gamepass','stores']);
   const alerts=commands.find(c=>c.name==='alerts');
   assert.equal(alerts.options[0].required,true);
   assert.ok(alerts.options.find(o=>o.name==='store').choices.every(c=>!c.value.startsWith('ps')));
@@ -304,4 +304,38 @@ test('DM offer selection applies preference, claimed, expiry and canonical sent 
  assert.equal(dmOffers(games,p,now).length,1);
  p.freeDMSeen=[offerKey(games[0])];assert.equal(dmOffers(games,p,now).length,0);
  p.freeDMSeen=[];p.claimed=['1'];assert.equal(dmOffers(games,p,now).length,0);
+});
+
+test('personal quiet hours wrap midnight and weekly digest honors weekday',()=>{
+ const p={dmTimezone:'America/Chicago',dmQuietStart:22,dmQuietEnd:7,dmDigestDay:0,dmDigestHour:18};
+ assert.equal(personalWindow(p,new Date('2026-10-18T04:00:00Z')).quiet,true);
+ const w=personalWindow(p,new Date('2026-10-18T23:00:00Z'));assert.equal(w.weeklyDue,true);
+ assert.equal(personalWindow({...p,dmDigestDate:w.day},new Date('2026-10-18T23:00:00Z')).weeklyDue,false);
+});
+test('exclusions match titles descriptions and available genres',()=>{
+ assert.equal(excluded({title:'Racer',genres:['Racing']},{exclusions:['racing']}),true);
+ assert.equal(excluded({title:'Adventure'},{exclusions:['racing']}),false);
+});
+test('observed price history separates currencies and never invents prior lows',()=>{
+ const prices={};const g={id:'10',priceData:{final:1000,currency:'USD',country:'US'}};
+ assert.equal(observePrice(prices,g,100).newLow,false);
+ assert.equal(observePrice(prices,{...g,priceData:{...g.priceData,final:500}},200).newLow,true);
+ assert.equal(observePrice(prices,{...g,priceData:{...g.priceData,currency:'EUR'}},300).newLow,false);
+});
+test('new releases exclude coming soon old releases and non-games',()=>{
+ const d={10:{success:true,data:{name:'Game',type:'game',is_free:false,release_date:{coming_soon:false,date:'Oct 16, 2026'},price_overview:{final:1999,currency:'USD',final_formatted:'$19.99'}}}};
+ const now=Date.parse('2026-10-17T00:00:00Z');assert.equal(releaseGame('10',d,now).releaseKind,'paid');
+ d[10].data.is_free=true;delete d[10].data.price_overview;assert.equal(releaseGame('10',d,now).releaseKind,'free');
+ d[10].data.release_date.coming_soon=true;assert.equal(releaseGame('10',d,now),null);
+});
+test('state backup recovers invalid JSON without resetting profiles',async()=>{
+ const {mkdtempSync,writeFileSync,readFileSync,rmSync}=await import('node:fs');
+ const {tmpdir}=await import('node:os');const {join}=await import('node:path');
+ const dir=mkdtempSync(join(tmpdir(),'freegames-state-'));
+ try{const store=stateStore(dir),state={channels:{},users:{test:{freeDM:true}}};store.save(state);writeFileSync(join(dir,'state.json'),'broken');const recovered=store.load();assert.equal(recovered.users.test.freeDM,true);assert.doesNotThrow(()=>JSON.parse(readFileSync(join(dir,'state.json'),'utf8')));}finally{rmSync(dir,{recursive:true,force:true});}
+});
+
+test('six notification categories fit Discord action row limits',()=>{
+ const streams=Object.fromEntries(['game','loot','weekend','deals','newfree','newpaid'].map(k=>[k,{channel:'1'}]));
+ const card=notificationHome(streams,'123');assert.ok(card.components.length<=5);assert.ok(card.components.every(r=>r.toJSON().components.length<=5));
 });

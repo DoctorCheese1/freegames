@@ -10,3 +10,6 @@ stat.json
 .update-backups/
 .update-version.json
 .runner-lock.json
+
+.state-backups/
+state.corrupt-*.json
